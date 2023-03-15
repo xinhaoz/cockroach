@@ -10,8 +10,15 @@
 
 import { Filters, getTimeValueInSeconds } from "../queryFilter";
 import { AggregateStatistics } from "../statementsTable";
-import { containAny, unset } from "../util";
+import {
+  CollectedStatementStatistics,
+  containAny,
+  FixFingerprintHexValue,
+  flattenStatementStats,
+  unset,
+} from "../util";
 import { filterBySearchQuery } from "../statementsPage";
+import { createSelector } from "@reduxjs/toolkit";
 
 export function filteredStatementsData(
   filters: Filters,
@@ -36,6 +43,10 @@ export function filteredStatementsData(
   }
   const regions = filters.regions?.length > 0 ? filters.regions.split(",") : [];
   const nodes = filters.nodes?.length > 0 ? filters.nodes.split(",") : [];
+  const appNames = filters.app
+    ?.split(",")
+    .map(app => app.trim())
+    .filter(appName => !!appName);
 
   // Return statements filtered by the values selected on the filter and
   // the search text. A statement must match all selected filters to be
@@ -43,6 +54,10 @@ export function filteredStatementsData(
   // Current filters: search text, database, fullScan, service latency,
   // SQL Type, nodes and regions.
   return statements
+    .filter(
+      statement =>
+        !appNames?.length || appNames.includes(statement.applicationName),
+    )
     .filter(
       statement =>
         databases.length == 0 || databases.includes(statement.database),
@@ -81,3 +96,34 @@ export function filteredStatementsData(
       search ? filterBySearchQuery(statement, search) : true,
     );
 }
+
+export const aggregateRawStmtsByStmtFingerprintID = (
+  rawStmts: CollectedStatementStatistics[],
+): AggregateStatistics[] => {
+  if (!rawStmts?.length) return [];
+
+  console.log("yeehaw");
+  const statements = flattenStatementStats(rawStmts);
+
+  return statements.map(stmt => {
+    return {
+      aggregatedFingerprintID: stmt.statement_fingerprint_id?.toString(),
+      aggregatedFingerprintHexID: FixFingerprintHexValue(
+        stmt.statement_fingerprint_id?.toString(16),
+      ),
+      label: stmt.statement,
+      summary: stmt.statement_summary,
+      aggregatedTs: stmt.aggregated_ts,
+      implicitTxn: stmt.implicit_txn,
+      fullScan: stmt.full_scan,
+      database: stmt.database,
+      applicationName: stmt.app,
+      stats: stmt.stats,
+    };
+  });
+};
+
+export const aggregateStmtsMemoized = createSelector(
+  (stmts: CollectedStatementStatistics[]) => stmts,
+  stmts => aggregateRawStmtsByStmtFingerprintID(stmts),
+);

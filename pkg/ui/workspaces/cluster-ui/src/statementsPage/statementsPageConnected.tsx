@@ -29,16 +29,10 @@ import {
 } from "./statementsPage";
 import {
   selectDatabases,
-  selectLastReset,
-  selectStatements,
-  selectStatementsDataValid,
-  selectStatementsDataInFlight,
-  selectStatementsLastError,
   selectColumns,
   selectSortSetting,
   selectFilters,
   selectSearch,
-  selectStatementsLastUpdated,
 } from "./statementsPage.selectors";
 import {
   selectTimeScale,
@@ -100,19 +94,14 @@ export const ConnectedStatementsPage = withRouter(
         isTenant: selectIsTenant(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
         hasAdminRole: selectHasAdminRole(state),
-        lastReset: selectLastReset(state),
         nodeRegions: nodeRegionsByIDSelector(state),
         search: selectSearch(state),
         sortSetting: selectSortSetting(state),
-        statements: selectStatements(state, props),
-        isDataValid: selectStatementsDataValid(state),
-        isReqInFlight: selectStatementsDataInFlight(state),
-        lastUpdated: selectStatementsLastUpdated(state),
-        statementsError: selectStatementsLastError(state),
         limit: selectStmtsPageLimit(state),
         reqSortSetting: selectStmtsPageReqSort(state),
         stmtsTotalRuntimeSecs:
           state.adminUI?.statements?.data?.stmts_total_runtime_secs ?? 0,
+        statementsResponse: state.adminUI.statements,
       },
       activePageProps: mapStateToRecentStatementsPageProps(state),
     }),

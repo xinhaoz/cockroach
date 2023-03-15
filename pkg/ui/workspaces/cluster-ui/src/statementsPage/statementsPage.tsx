@@ -78,8 +78,12 @@ import moment from "moment";
 import {
   InsertStmtDiagnosticRequest,
   StatementDiagnosticsReport,
+  SqlStatsResponse,
 } from "../api";
-import { filteredStatementsData } from "../sqlActivity/util";
+import {
+  filteredStatementsData,
+  aggregateStmtsMemoized,
+} from "../sqlActivity/util";
 import {
   STATS_LONG_LOADING_DURATION,
   stmtRequestSortOptions,
@@ -89,6 +93,7 @@ import {
 } from "src/util/sqlActivityConstants";
 import { SearchCriteria } from "src/searchCriteria/searchCriteria";
 import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import { RequestState } from "src/api/types";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
@@ -130,17 +135,12 @@ export interface StatementsPageDispatchProps {
   onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) => void;
 }
 export interface StatementsPageStateProps {
-  statements: AggregateStatistics[];
-  isDataValid: boolean;
-  isReqInFlight: boolean;
-  lastUpdated: moment.Moment | null;
+  statementsResponse: RequestState<SqlStatsResponse>;
   timeScale: TimeScale;
   limit: number;
   reqSortSetting: SqlStatsSortType;
-  statementsError: Error | null;
   apps: string[];
   databases: string[];
-  lastReset: string;
   columns: string[];
   nodeRegions: { [key: string]: string };
   sortSetting: SortSetting;
@@ -351,9 +351,9 @@ export class StatementsPage extends React.Component<
     if (ts !== this.props.timeScale) {
       this.changeTimeScale(ts);
     } else if (
-      !this.props.isDataValid ||
-      !this.props.lastUpdated ||
-      !this.props.statements
+      !this.props.statementsResponse.valid ||
+      !this.props.statementsResponse.data ||
+      !this.props.statementsResponse.lastUpdated
     ) {
       this.refreshStatements();
     }
@@ -517,7 +517,9 @@ export class StatementsPage extends React.Component<
     return found;
   };
 
-  renderStatements = (): React.ReactElement => {
+  renderStatements = (
+    statements: AggregateStatistics[],
+  ): React.ReactElement => {
     const { pagination, filters, activeFilters } = this.state;
     const {
       onSelectDiagnosticsReportDropdownOption,
@@ -533,7 +535,6 @@ export class StatementsPage extends React.Component<
       databases,
       hasAdminRole,
     } = this.props;
-    const statements = this.props.statements ?? [];
     const data = filteredStatementsData(
       filters,
       search,
@@ -709,6 +710,11 @@ export class StatementsPage extends React.Component<
       onActivateStatementDiagnostics,
       onDiagnosticsModalOpen,
     } = this.props;
+
+    const statements = aggregateStmtsMemoized(
+      this.props.statementsResponse?.data?.statements,
+    );
+
     const longLoadingMessage = (
       <Delayed delay={STATS_LONG_LOADING_DURATION}>
         <InlineAlert
@@ -732,21 +738,21 @@ export class StatementsPage extends React.Component<
         />
         <div className={cx("table-area")}>
           <Loading
-            loading={this.props.isReqInFlight}
+            loading={this.props.statementsResponse.inFlight}
             page={"statements"}
-            error={this.props.statementsError}
-            render={() => this.renderStatements()}
+            error={this.props.statementsResponse.error}
+            render={() => this.renderStatements(statements)}
             renderError={() =>
               LoadingError({
                 statsType: "statements",
-                timeout: this.props.statementsError?.name
+                timeout: this.props.statementsResponse?.error?.name
                   ?.toLowerCase()
                   .includes("timeout"),
               })
             }
           />
-          {this.props.isReqInFlight &&
-            getValidErrorsList(this.props.statementsError) == null &&
+          {this.props.statementsResponse.inFlight &&
+            getValidErrorsList(this.props.statementsResponse.error) == null &&
             longLoadingMessage}
           <ActivateStatementDiagnosticsModal
             ref={this.activateDiagnosticsRef}
