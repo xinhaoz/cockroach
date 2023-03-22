@@ -12,6 +12,7 @@ import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import {
+  createSelectorForCachedDataField,
   refreshNodes,
   refreshTxns,
   refreshUserSQLRoles,
@@ -45,11 +46,6 @@ import {
   mapStateToRecentTransactionsPageProps,
 } from "./recentTransactionsSelectors";
 import { selectTimeScale } from "src/redux/timeScale";
-import {
-  selectTxnsLastUpdated,
-  selectTxnsDataValid,
-  selectTxnsDataInFlight,
-} from "src/selectors/executionFingerprintsSelectors";
 import { trackApplySearchCriteriaAction } from "src/redux/analyticsActions";
 
 // selectData returns the array of AggregateStatistics to show on the
@@ -116,6 +112,8 @@ export const limitSetting = new LocalSetting(
   api.DEFAULT_STATS_REQ_OPTIONS.limit,
 );
 
+const selectTxns = createSelectorForCachedDataField("transactions");
+
 const fingerprintsPageActions = {
   refreshData: refreshTxns,
   refreshNodes,
@@ -167,10 +165,7 @@ const TransactionsPageConnected = withRouter(
       fingerprintsPageProps: {
         ...props,
         columns: transactionColumnsLocalSetting.selectorToArray(state),
-        data: selectData(state),
-        isDataValid: selectTxnsDataValid(state),
-        isReqInFlight: selectTxnsDataInFlight(state),
-        lastUpdated: selectTxnsLastUpdated(state),
+        txnsResp: selectTxns(state),
         timeScale: selectTimeScale(state),
         error: selectLastError(state),
         filters: filtersLocalSetting.selector(state),
@@ -178,7 +173,6 @@ const TransactionsPageConnected = withRouter(
         nodeRegions: nodeRegionsByIDSelector(state),
         search: searchLocalSetting.selector(state),
         sortSetting: sortSettingLocalSetting.selector(state),
-        statementsError: state.cachedData.transactions.lastError,
         hasAdminRole: selectHasAdminRole(state),
         limit: limitSetting.selector(state),
         reqSortSetting: reqSortSetting.selector(state),
