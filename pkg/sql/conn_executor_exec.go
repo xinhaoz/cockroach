@@ -3090,17 +3090,20 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent, txnErr err
 			)
 		}
 
-		err = ex.recordTransactionFinish(ctx, transactionFingerprintID, ev, implicit, txnStart, txnErr)
+		txnCounter := int(ex.extraTxnState.txnCounter.Load())
+
+		err = ex.recordTransactionFinish(ctx, transactionFingerprintID, ev, implicit, txnStart, txnErr, txnCounter)
 		if err != nil {
 			if log.V(1) {
 				log.Warningf(ctx, "failed to record transaction stats: %s", err)
 			}
 			ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
 		}
+
 		// If we have a commitTimestamp, we should use it.
 		ex.previousTransactionCommitTimestamp.Forward(ev.commitTimestamp)
+
 		if telemetryLoggingEnabled.Get(&ex.server.cfg.Settings.SV) {
-			txnCounter := int(ex.extraTxnState.txnCounter.Load())
 			txnKey := createTelemetryTransactionID(ex.planner.extendedEvalCtx.SessionID, txnCounter)
 			ex.server.TelemetryLoggingMetrics.onTxnFinish(txnKey)
 		}
@@ -3180,6 +3183,7 @@ func (ex *connExecutor) recordTransactionFinish(
 	implicit bool,
 	txnStart time.Time,
 	txnErr error,
+	txnCounter int,
 ) error {
 	recordingStart := timeutil.Now()
 	defer func() {
@@ -3255,11 +3259,20 @@ func (ex *connExecutor) recordTransactionFinish(
 
 	ex.maybeRecordRetrySerializableContention(ev.txnID, transactionFingerprintID, txnErr)
 
+	ex.planner.maybeLogTransaction(ctx,
+		ex.executorType,
+		txnCounter,
+		transactionFingerprintID,
+		&recordedTxnStats,
+		ex.server.TelemetryLoggingMetrics,
+	)
+
 	return ex.statsCollector.RecordTransaction(
 		ctx,
 		transactionFingerprintID,
 		recordedTxnStats,
 	)
+
 }
 
 // Records a SERIALIZATION_CONFLICT contention event to the contention registry event

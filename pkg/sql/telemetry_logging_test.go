@@ -36,11 +36,105 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtestutils"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
+
+type testQuery struct {
+	query          string
+	logTime        float64
+	tracingEnabled bool
+}
+
+type expectedStmtLog struct {
+	logMsg            string
+	skippedQueryCount int
+}
+
+// New telemetry logging tests should use the telemetryLogSpy
+// instead of retrieving the logs from the file system.
+type telemetryLogSpy struct {
+	mu struct {
+		syncutil.RWMutex
+		logs   []logpb.Entry
+		filter func(entry logpb.Entry) bool
+	}
+}
+
+func (t *telemetryLogSpy) Intercept(entry []byte) {
+	var logEntry logpb.Entry
+
+	if err := json.Unmarshal(entry, &logEntry); err != nil {
+		return
+	}
+
+	if logEntry.Channel != logpb.Channel_TELEMETRY {
+		return
+	}
+
+	if t.mu.filter != nil && !t.mu.filter(logEntry) {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.logs = append(t.mu.logs, logEntry)
+}
+
+func (t *telemetryLogSpy) clearCollectedLogs() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.logs = make([]logpb.Entry, 0)
+}
+
+func (t *telemetryLogSpy) getStatementLogs(stripRedactMarkers bool) []eventpb.SampledQuery {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var statementLogs []eventpb.SampledQuery
+	for _, logEntry := range t.mu.logs {
+		if !strings.Contains(logEntry.Message, "sampled_query") {
+			continue
+		}
+
+		var statementLog eventpb.SampledQuery
+		if err := json.Unmarshal([]byte(logEntry.Message[logEntry.StructuredStart:logEntry.StructuredEnd]), &statementLog); err != nil {
+			continue
+		}
+
+		if stripRedactMarkers {
+			statementLog.Statement = redact.RedactableString(statementLog.Statement.StripMarkers())
+		}
+
+		statementLogs = append(statementLogs, statementLog)
+	}
+
+	return statementLogs
+}
+
+func (t *telemetryLogSpy) getTransactionLogs() []eventpb.SampledTransaction {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var transactionLogs []eventpb.SampledTransaction
+	for _, logEntry := range t.mu.logs {
+		if !strings.Contains(logEntry.Message, "sampled_transaction") {
+			continue
+		}
+
+		var transactionLog eventpb.SampledTransaction
+		if err := json.Unmarshal([]byte(logEntry.Message[logEntry.StructuredStart:logEntry.StructuredEnd]), &transactionLog); err != nil {
+			continue
+		}
+
+		transactionLogs = append(transactionLogs, transactionLog)
+	}
+
+	return transactionLogs
+}
 
 // TestTelemetryLogging verifies that telemetry events are logged to the telemetry log
 // and are sampled according to the configured sample rate.
@@ -441,6 +535,17 @@ func TestTelemetryLogging(t *testing.T) {
 	}
 
 	log.FlushFiles()
+
+	// We should not see any transaction events in statement
+	// telemetry mode.
+	txnEntries, err := log.FetchEntriesFromFiles(
+		0,
+		math.MaxInt64,
+		10000,
+		regexp.MustCompile(`"EventType":"sampled_transaction"`),
+		log.WithMarkedSensitiveData,
+	)
+	require.Emptyf(t, txnEntries, "found unexpected transaction telemetry events: %v", txnEntries)
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -1667,220 +1772,6 @@ func TestTelemetryLoggingStmtPosInTxn(t *testing.T) {
 	}
 }
 
-type testQuery struct {
-	query          string
-	logTime        float64
-	tracingEnabled bool
-}
-
-type expectedLog struct {
-	logMsg            string
-	skippedQueryCount int
-}
-
-// TestTelemetryLoggingTxnMode tests that when the telemetry logging is set to "transaction",
-// we sample events at the transaction level, which means that we'll emit all statements
-// for a transaction as if they were counted as 1 emitted event.
-func TestTelemetryLoggingTxnMode(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	sc := log.ScopeWithoutShowLogs(t)
-	defer sc.Close(t)
-
-	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
-	defer cleanup()
-
-	st := logtestutils.StubTime{}
-	sts := logtestutils.StubTracingStatus{}
-
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			EventLog: &EventLogTestingKnobs{
-				// The sampling checks below need to have a deterministic
-				// number of statements run by internal executor.
-				SyncWrites: true,
-			},
-			TelemetryLoggingKnobs: &TelemetryLoggingTestingKnobs{
-				getTimeNow:       st.TimeNow,
-				getTracingStatus: sts.TracingStatus,
-			},
-		},
-	})
-
-	defer s.Stopper().Stop(context.Background())
-
-	queries := []testQuery{
-		{
-			query:   "BEGIN; TRUNCATE t; COMMIT",
-			logTime: 0.1, // Logged.
-		},
-		{
-			query:   "BEGIN; SELECT 1; SELECT 2; SELECT 3; COMMIT",
-			logTime: 1, // Logged.
-		},
-		{
-			query:   "SELECT 1, 2;",
-			logTime: 1, // Skipped.
-		},
-		{
-			query:          "SELECT 1, 2;",
-			logTime:        1, // Logged. Tracing is enabled.
-			tracingEnabled: true,
-		},
-		{
-			query:   `SELECT * FROM t LIMIT 1`,
-			logTime: 1.05, // Skipped.
-		},
-		{
-			query:   `SELECT * FROM t LIMIT 1`,
-			logTime: 1.08, // Skipped.
-		},
-		{
-			query:   `SELECT * FROM t LIMIT 2`,
-			logTime: 1.1, // Logged.
-		},
-		{
-			query:   `BEGIN; SELECT * FROM t LIMIT 3; COMMIT`,
-			logTime: 1.15, // Skipped.
-		},
-		{
-			query:   `BEGIN; SELECT * FROM t LIMIT 4; SELECT * FROM t LIMIT 5; COMMIT`,
-			logTime: 1.2, // Logged.
-		},
-	}
-
-	expectedLogs := []expectedLog{
-		{
-			logMsg:            `BEGIN TRANSACTION`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `TRUNCATE TABLE defaultdb.public.t`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `COMMIT TRANSACTION`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `BEGIN TRANSACTION`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `SELECT ‹1›`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `SELECT ‹2›`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `SELECT ‹3›`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `COMMIT TRANSACTION`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `SELECT ‹1›, ‹2›`,
-			skippedQueryCount: 1,
-		},
-		{
-			logMsg:            `SELECT * FROM ""."".t LIMIT ‹2›`,
-			skippedQueryCount: 2,
-		},
-		{
-			logMsg:            `BEGIN TRANSACTION`,
-			skippedQueryCount: 3,
-		},
-		{
-			logMsg:            `SELECT * FROM ""."".t LIMIT ‹4›`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `SELECT * FROM ""."".t LIMIT ‹5›`,
-			skippedQueryCount: 0,
-		},
-		{
-			logMsg:            `COMMIT TRANSACTION`,
-			skippedQueryCount: 0,
-		},
-	}
-
-	db := sqlutils.MakeSQLRunner(sqlDB)
-	st.SetTime(timeutil.FromUnixMicros(0))
-	db.Exec(t, `SET application_name = 'telemetry-logging-test-txn-mode'`)
-	db.Exec(t, "CREATE TABLE t();")
-	db.Exec(t, "CREATE TABLE u(x int);")
-
-	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.max_event_frequency = 10;`)
-	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.mode = "transaction";`)
-	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true;`)
-
-	for _, query := range queries {
-		stubTime := timeutil.FromUnixMicros(int64(query.logTime * 1e6))
-		st.SetTime(stubTime)
-		sts.SetTracingStatus(query.tracingEnabled)
-		db.Exec(t, query.query)
-	}
-
-	log.FlushFiles()
-
-	entries, err := log.FetchEntriesFromFiles(
-		0,
-		math.MaxInt64,
-		10000,
-		regexp.MustCompile(`"EventType":"sampled_query"`),
-		log.WithMarkedSensitiveData,
-	)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(entries) == 0 {
-		t.Fatal(errors.Newf("no entries found"))
-	}
-
-	for _, e := range entries {
-		if strings.Contains(e.Message, `"ExecMode":"`+executorTypeInternal.logLabel()) {
-			t.Errorf("unexpected telemetry event for internal statement:\n%s", e.Message)
-		}
-	}
-
-	expectedLogCount := len(expectedLogs)
-	require.GreaterOrEqualf(t, len(entries), expectedLogCount,
-		"expected at least %d log entries, got: %d\nentries:\n%v", expectedLogCount, len(entries), entries)
-
-	// FetchEntriesFromFiles delivers entries in reverse order.
-	entryIdx := len(entries) - 1
-
-	// Skip the cluster setting queries.
-	for strings.Contains(entries[entryIdx].Message, "SET CLUSTER SETTING") {
-		entryIdx--
-	}
-
-	for i := 0; i < expectedLogCount; i++ {
-		e := entries[entryIdx-i]
-
-		var sq eventpb.SampledQuery
-		err = json.Unmarshal([]byte(e.Message), &sq)
-		require.NoError(t, err)
-
-		if !strings.Contains(string(sq.Statement), expectedLogs[i].logMsg) {
-			t.Fatalf("expected log message to contain:\n%s\nbut received:\n%s\nentries:\n%v\n",
-				expectedLogs[i].logMsg, sq.Statement, entries)
-		}
-
-		expectedSkipped := expectedLogs[i].skippedQueryCount
-		if expectedSkipped == 0 {
-			require.Zerof(t, sq.SkippedQueries, "expected no skipped queries, found:\n%s", e.Message)
-		} else {
-			require.Equalf(t, uint64(expectedSkipped), sq.SkippedQueries, "expected skipped queries, found:\n%s", e.Message)
-		}
-	}
-}
-
 // TestTelemetryLoggingClearsTxns tests that when the telemetry logging is set to "statements",
 // the list of tracked txns is cleared.
 func TestTelemetryLoggingClearsTxns(t *testing.T) {
@@ -1923,7 +1814,7 @@ func TestTelemetryLoggingClearsTxns(t *testing.T) {
 	st.SetTime(timeutil.FromUnixMicros(0))
 	db.Exec(t, `SET application_name = 'telemetry-logging-test-txns-cleared'`)
 
-	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.max_event_frequency = 10;`)
+	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.transaction_sampling.frequency = 10;`)
 	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.mode = "transaction";`)
 	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true;`)
 
@@ -2070,7 +1961,7 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 		},
 	}
 
-	expectedLogs := []expectedLog{
+	expectedLogs := []expectedStmtLog{
 		{
 			logMsg:            `BEGIN TRANSACTION`,
 			skippedQueryCount: 0,
@@ -2107,7 +1998,7 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 	db.Exec(t, `SET application_name = 'telemetry-logging-test-txn-limit'`)
 
 	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.txn_mode.tracking_limit = 1;`)
-	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.max_event_frequency = 10;`)
+	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.transaction_sampling.frequency = 10;`)
 	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.mode = "transaction";`)
 	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true;`)
 
@@ -2177,4 +2068,324 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 			require.Equalf(t, uint64(expectedSkipped), sq.SkippedQueries, "expected skipped queries, found:\n%s", e.Message)
 		}
 	}
+}
+
+// TestTelemetryLoggingTransactionMode verifies that in transaction mode, we
+// limit the number of statements logged per txn to the value of the cluster setting
+// sql.telemetry.transaction_sampling.statement_events_per_transaction.max.
+func TestTelemetryLoggingTransactionMode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	appName := "telemetry-logging-transaction-mode"
+	ctx := context.Background()
+	logSpy := telemetryLogSpy{}
+	logSpy.mu.filter = func(entry logpb.Entry) bool {
+		return strings.Contains(entry.Message, appName)
+	}
+	cleanup := log.InterceptWith(ctx, &logSpy)
+	defer cleanup()
+
+	st := logtestutils.StubTime{}
+	st.SetTime(timeutil.FromUnixMicros(0))
+	sts := logtestutils.StubTracingStatus{}
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			TelemetryLoggingKnobs: &TelemetryLoggingTestingKnobs{
+				getTimeNow:       st.TimeNow,
+				getTracingStatus: sts.TracingStatus,
+			},
+		},
+	})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
+	telemetryLogging := s.SQLServer().(*Server).TelemetryLoggingMetrics
+	setupConn := sqlutils.MakeSQLRunner(s.SQLConn(t))
+	setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.mode = "transaction";`)
+
+	setSettingsForSubTest := func(t *testing.T, samplingFrequency int, trackedTxnsLimit int, stmtsPerTxnLimit int) {
+		setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.transaction_sampling.frequency = $1`, samplingFrequency)
+		setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.txn_mode.tracking_limit = $1`, trackedTxnsLimit)
+		setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.transaction_sampling.statement_events_per_transaction.max = $1`, stmtsPerTxnLimit)
+	}
+
+	// Every subtest will start with a clean logspy and reset the last
+	// emitted time. All subtests should enable query sampling to start logging.
+	cleanupFn := func() {
+		setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = false;`)
+		sts.SetTracingStatus(false)
+		logSpy.clearCollectedLogs()
+		telemetryLogging.ResetLastEmittedTime()
+	}
+
+	// Queries that are spied on should be executed using this connection.
+	spiedConn := sqlutils.MakeSQLRunner(s.SQLConn(t))
+	spiedConn.Exec(t, `SET application_name = $1`, appName)
+
+	t.Run("respects statements per transaction limit", func(t *testing.T) {
+		t.Cleanup(cleanupFn)
+
+		// We should not log more statements per transaction than the limit
+		// specified by the cluster setting sql.telemetry.transaction_sampling.statement_events_per_transaction.max.
+		txnsLimit := 100
+		samplingFrequency := 9999999999999 // Sample all transactions.
+		setSettingsForSubTest(t, samplingFrequency, txnsLimit, 1)
+
+		// Array of transactions.
+		txns := [][]string{
+			{"BEGIN", "SELECT 1", "SELECT 2", "COMMIT"},
+			{"SELECT 3"},
+			{"SELECT 4"},
+			{"BEGIN", "SELECT 5", "SELECT 6", "SELECT 7", "COMMIT"},
+			{"SELECT 8"},
+		}
+
+		testutils.RunValues(t, "stmtsPerTxnLimit", []int{1, 2, 3, 4, 5}, func(t *testing.T, stmtsPerTxnLimit int) {
+			t.Cleanup(cleanupFn)
+
+			setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.transaction_sampling.statement_events_per_transaction.max = $1`, stmtsPerTxnLimit)
+			setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true`)
+
+			for _, tx := range txns {
+				for _, query := range tx {
+					st.SetTime(st.TimeNow().Add(10 * time.Millisecond))
+					spiedConn.Exec(t, query)
+				}
+			}
+
+			log.FlushAllSync()
+
+			stmtLogs := logSpy.getStatementLogs(true /* stripRedactionMarkers */)
+			txnLogs := logSpy.getTransactionLogs()
+			require.Equal(t, len(txns), len(txnLogs))
+
+			var stmtLogsIdx, skippedStmtsCount int
+			// Verify expected statement logs are present.
+			for ti, txnQueries := range txns {
+				txn := txnLogs[ti]
+				txnID := txn.TransactionID
+
+				require.Zero(t, txn.SkippedTransactions)
+
+				// All the statement logs for a transaction are contiguous in the log file.
+				// If this is not true something is wrong.
+				stmtsCount := 0
+				for {
+					stmt := stmtLogs[stmtLogsIdx]
+					require.Contains(t, stmt.Statement, txnQueries[stmtsCount])
+					if stmtsCount == 0 {
+						require.Equal(t, skippedStmtsCount, int(stmt.SkippedQueries))
+					}
+					if stmt.Tag != "BEGIN" && stmt.Tag != "COMMIT" {
+						require.Contains(t, txn.StatementFingerprintIDs, appstatspb.StmtFingerprintID(stmt.StatementFingerprintID),
+							"stmt: %v txnStmtFingerprints:: %v", stmt, txn.StatementFingerprintIDs)
+					}
+
+					stmtsCount++
+					stmtLogsIdx++
+					if stmtLogsIdx == len(stmtLogs) || stmtLogs[stmtLogsIdx].TransactionID != txnID {
+						break
+					}
+				}
+
+				if stmtsCount > stmtsPerTxnLimit {
+					t.Fatalf("expected number of statements logged per txn to be less than or equal to the limit\nlogged: %d, txn: %v", stmtsCount, txn)
+				}
+
+				if stmtsCount < len(txnQueries) && len(txnQueries) <= stmtsPerTxnLimit {
+					t.Fatalf("expected all statements to be logged for this txn: %v", txnQueries)
+				}
+
+				skippedStmtsCount = len(txnQueries) - stmtsCount
+			}
+
+		})
+
+	})
+
+	t.Run("successfully samples transaction executions", func(t *testing.T) {
+		t.Cleanup(cleanupFn)
+
+		queries := []testQuery{
+			{
+				query:   "BEGIN; TRUNCATE t; COMMIT",
+				logTime: 0.1, // Logged.
+			},
+			{
+				query:   "BEGIN; SELECT 1; SELECT 2; SELECT 3; COMMIT",
+				logTime: 1, // Logged.
+			},
+			{
+				query:   "SELECT 1, 2;",
+				logTime: 1, // Skipped.
+			},
+			{
+				query:          "SELECT 1, 2;",
+				logTime:        1, // Logged. Tracing is enabled.
+				tracingEnabled: true,
+			},
+			{
+				query:   `SELECT * FROM t LIMIT 1`,
+				logTime: 1.05, // Skipped.
+			},
+			{
+				query:   `SELECT * FROM t LIMIT 1`,
+				logTime: 1.08, // Skipped.
+			},
+			{
+				query:   `SELECT * FROM t LIMIT 2`,
+				logTime: 1.1, // Logged.
+			},
+			{
+				query:   `BEGIN; SELECT * FROM t LIMIT 3; COMMIT`,
+				logTime: 1.15, // Skipped.
+			},
+			{
+				query:   `BEGIN; SELECT * FROM t LIMIT 4; SELECT * FROM t LIMIT 5; COMMIT`,
+				logTime: 1.2, // Logged.
+			},
+		}
+
+		expectedTxns := []struct {
+			stmts           []expectedStmtLog
+			skippedTxnCount int64
+		}{
+			{
+				skippedTxnCount: 0,
+				stmts: []expectedStmtLog{
+					{
+						logMsg:            `BEGIN`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `TRUNCATE TABLE defaultdb.public.t`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `COMMIT TRANSACTION`,
+						skippedQueryCount: 0,
+					},
+				},
+			},
+			{
+				skippedTxnCount: 0,
+				stmts: []expectedStmtLog{
+					{
+						logMsg:            `BEGIN`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `SELECT 1`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `SELECT 2`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `SELECT 3`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `COMMIT TRANSACTION`,
+						skippedQueryCount: 0,
+					},
+				},
+			},
+			{
+				skippedTxnCount: 1,
+				stmts: []expectedStmtLog{
+					{
+						logMsg:            `SELECT 1, 2`,
+						skippedQueryCount: 1,
+					},
+				},
+			},
+			{
+				skippedTxnCount: 2,
+				stmts: []expectedStmtLog{
+					{
+						logMsg:            `SELECT * FROM ""."".t LIMIT 2`,
+						skippedQueryCount: 2,
+					},
+				},
+			},
+			{
+				skippedTxnCount: 1,
+				stmts: []expectedStmtLog{
+					{
+						logMsg:            `BEGIN`,
+						skippedQueryCount: 3,
+					},
+					{
+						logMsg:            `SELECT * FROM ""."".t LIMIT 4`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `SELECT * FROM ""."".t LIMIT 5`,
+						skippedQueryCount: 0,
+					},
+					{
+						logMsg:            `COMMIT TRANSACTION`,
+						skippedQueryCount: 0,
+					},
+				},
+			},
+		}
+
+		st.SetTime(timeutil.FromUnixMicros(0))
+		setupConn.Exec(t, "CREATE TABLE t();")
+		setupConn.Exec(t, "CREATE TABLE u(x int);")
+
+		samplingFrequency := 10
+		setSettingsForSubTest(t, samplingFrequency, 100, 100)
+
+		setupConn.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true`)
+		for _, query := range queries {
+			stubTime := timeutil.FromUnixMicros(int64(query.logTime * 1e6))
+			st.SetTime(stubTime)
+			sts.SetTracingStatus(query.tracingEnabled)
+			spiedConn.Exec(t, query.query)
+			t.Logf("last emitted time %d", telemetryLogging.mu.lastEmittedTime.UnixMicro())
+		}
+
+		log.FlushAllSync()
+
+		stmtLogs := logSpy.getStatementLogs(true /* stripRedactionMarkers */)
+		txnLogs := logSpy.getTransactionLogs()
+
+		var stmtLogsIdx int
+		for ti, expectedTxn := range expectedTxns {
+			txn := txnLogs[ti]
+			txnID := txn.TransactionID
+
+			require.Equalf(t, expectedTxn.skippedTxnCount, txn.SkippedTransactions, "expected txn: %v\n", stmtLogsIdx)
+
+			// All the statement logs for a transaction are contiguous in the log file.
+			// If this is not true something is wrong.
+			stmtsCount := 0
+			for {
+				stmt := stmtLogs[stmtLogsIdx]
+				expectedStmt := expectedTxn.stmts[stmtsCount]
+				t.Logf("%s %d", stmt.Statement, stmt.TxnCounter)
+				require.Contains(t, stmt.Statement, expectedStmt.logMsg)
+				require.Equal(t, expectedStmt.skippedQueryCount, int(stmt.SkippedQueries))
+				if stmt.Tag != "BEGIN" && stmt.Tag != "COMMIT" {
+					require.Contains(t, txn.StatementFingerprintIDs, appstatspb.StmtFingerprintID(stmt.StatementFingerprintID))
+				}
+
+				stmtsCount++
+				stmtLogsIdx++
+				if stmtLogsIdx == len(stmtLogs) || stmtLogs[stmtLogsIdx].TransactionID != txnID {
+					break
+				}
+			}
+
+			require.Equal(t, len(expectedTxn.stmts), stmtsCount)
+		}
+
+	})
+
 }
