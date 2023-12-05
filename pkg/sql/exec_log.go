@@ -144,12 +144,13 @@ func (p *planner) maybeLogStatement(
 	stmtFingerprintID appstatspb.StmtFingerprintID,
 	queryStats *topLevelQueryStats,
 	statsCollector sqlstats.StatsCollector,
+	txnIsTracked bool,
 ) {
 	p.maybeAuditRoleBasedAuditEvent(ctx, execType)
 	p.maybeLogStatementInternal(ctx, execType, numRetries, txnCounter,
 		rows, stmtCount, bulkJobId, err, queryReceived, hasAdminRoleCache,
 		telemetryLoggingMetrics, stmtFingerprintID, queryStats, statsCollector,
-	)
+		txnIsTracked)
 }
 
 func (p *planner) maybeLogStatementInternal(
@@ -164,6 +165,7 @@ func (p *planner) maybeLogStatementInternal(
 	stmtFingerprintID appstatspb.StmtFingerprintID,
 	topLevelQueryStats *topLevelQueryStats,
 	statsCollector sqlstats.StatsCollector,
+	txnIsTracked bool,
 ) {
 	// Note: if you find the code below crashing because p.execCfg == nil,
 	// do not add a test "if p.execCfg == nil { do nothing }" !
@@ -308,10 +310,14 @@ func (p *planner) maybeLogStatementInternal(
 		forceLog := shouldForceLogStatementType(p.stmt.AST.StatementType(), p.stmt.AST.StatementTag()) ||
 			tracingEnabled || logConsoleQuery
 
-		txnTrackingID := createTelemetryTransactionID(p.extendedEvalCtx.SessionID, txnCounter)
-		isFirstStmt := stmtCount == 0 || (p.extendedEvalCtx.Context.TxnImplicit && stmtCount == 1)
+		isImplicit := p.EvalContext().TxnImplicit
+		loggedStmtNumber := stmtCount
+		if !isImplicit {
+			// BEGIN has a 0 stmtCount.
+			loggedStmtNumber++
+		}
 
-		if telemetryMetrics.shouldEmitStatementLog(telemetryMetrics.timeNow(), txnTrackingID, forceLog, isFirstStmt) {
+		if telemetryMetrics.shouldEmitStatementLog(telemetryMetrics.timeNow(), txnIsTracked, loggedStmtNumber, forceLog) {
 			var queryLevelStats execstats.QueryLevelStats
 			if stats, ok := p.instrumentation.GetQueryLevelStats(); ok {
 				queryLevelStats = *stats
@@ -453,23 +459,22 @@ func (p *planner) maybeLogTransaction(
 	txnFingerprintID appstatspb.TransactionFingerprintID,
 	txnStats *sqlstats.RecordedTxnStats,
 	telemetryLoggingMetrics *TelemetryLoggingMetrics,
+	txnIsTracked bool,
 ) {
 	tracingEnabled := telemetryLoggingMetrics.isTracing(p.curPlan.instrumentation.Tracing())
 	logConsoleQuery := telemetryInternalConsoleQueriesEnabled.Get(&p.execCfg.Settings.SV) &&
 		strings.HasPrefix(p.SessionData().ApplicationName, "$ internal-console")
 	isTxnTelemetryMode := telemetrySamplingMode.Get(&p.execCfg.Settings.SV) == telemetryModeTransaction
 
-	// Exit if transaction telemetry logging is not enabled or if we have an internal transaction
-	// and internal logging is not enabled.
+	//Exit if transaction telemetry logging is not enabled or if we have an internal transaction
+	//and internal logging is not enabled.
 	if !telemetryLoggingEnabled.Get(&p.execCfg.Settings.SV) || !isTxnTelemetryMode ||
 		(execType == executorTypeInternal && !telemetryInternalQueriesEnabled.Get(&p.execCfg.Settings.SV)) {
 		return
 	}
 
 	forceLog := tracingEnabled || logConsoleQuery
-
-	txnTrackingID := createTelemetryTransactionID(p.extendedEvalCtx.SessionID, txnCounter)
-	if !telemetryLoggingMetrics.shouldEmitTransactionLog(txnTrackingID, forceLog) {
+	if !txnIsTracked && !forceLog {
 		telemetryLoggingMetrics.incSkippedTransactionCount()
 		return
 	}

@@ -820,12 +820,15 @@ func (ex *connExecutor) execStmtInOpenState(
 			stmtFingerprintID,
 			&topLevelQueryStats{},
 			ex.statsCollector,
-		)
+			ex.extraTxnState.isTrackedTelemetryTxn)
 	}()
 
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:
 		// BEGIN is only allowed if we are in an implicit txn.
+		if ex.server.TelemetryLoggingMetrics.shouldTrackTransaction(ex.executorType == executorTypeInternal) {
+			ex.extraTxnState.isTrackedTelemetryTxn = true
+		}
 		if os.ImplicitTxn.Get() {
 			// When executing the BEGIN, we also need to set any transaction modes
 			// that were specified on the BEGIN statement.
@@ -1760,7 +1763,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 						ppInfo.dispatchToExecutionEngine.stmtFingerprintID,
 						ppInfo.dispatchToExecutionEngine.queryStats,
 						ex.statsCollector,
-					)
+						ex.extraTxnState.isTrackedTelemetryTxn)
 				},
 			})
 		} else {
@@ -1787,7 +1790,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 				stmtFingerprintID,
 				&stats,
 				ex.statsCollector,
-			)
+				ex.extraTxnState.isTrackedTelemetryTxn)
 		}
 	}()
 
@@ -2468,13 +2471,16 @@ func (ex *connExecutor) execStmtInNoTxnState(
 			stmtFingerprintID,
 			&topLevelQueryStats{},
 			ex.statsCollector,
-		)
+			ex.extraTxnState.isTrackedTelemetryTxn)
 	}()
 
 	ast := parserStmt.AST
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:
 		ex.incrementStartedStmtCounter(ast)
+		if ex.server.TelemetryLoggingMetrics.shouldTrackTransaction(ex.executorType == executorTypeInternal) {
+			ex.extraTxnState.isTrackedTelemetryTxn = true
+		}
 		defer func() {
 			if !payloadHasError(payload) {
 				ex.incrementExecutedStmtCounter(ast)
@@ -3103,9 +3109,9 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent, txnErr err
 		// If we have a commitTimestamp, we should use it.
 		ex.previousTransactionCommitTimestamp.Forward(ev.commitTimestamp)
 
-		if telemetryLoggingEnabled.Get(&ex.server.cfg.Settings.SV) {
-			txnKey := createTelemetryTransactionID(ex.planner.extendedEvalCtx.SessionID, txnCounter)
-			ex.server.TelemetryLoggingMetrics.onTxnFinish(txnKey)
+		if ex.extraTxnState.isTrackedTelemetryTxn {
+			ex.server.TelemetryLoggingMetrics.onTrackedTxnFinish()
+			ex.extraTxnState.isTrackedTelemetryTxn = false
 		}
 	}
 }
@@ -3139,9 +3145,18 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 		TxnFingerprintID: appstatspb.InvalidTransactionFingerprintID,
 	})
 
+	isImplicitTxn := ex.implicitTxn()
+
+	telemetryLogging := ex.server.TelemetryLoggingMetrics
 	ex.state.mu.RLock()
 	txnStart := ex.state.mu.txnStart
 	ex.state.mu.RUnlock()
+
+	// If this is an explicit transaction, we would have determined whether to
+	// log this transaction earlier.
+	if isImplicitTxn && telemetryLogging.shouldTrackTransaction(ex.executorType == executorTypeInternal) {
+		ex.extraTxnState.isTrackedTelemetryTxn = true
+	}
 
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionTransactionStarted, txnStart)
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionFirstStartExecTransaction, timeutil.Now())
@@ -3168,7 +3183,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 
 	ex.extraTxnState.shouldExecuteOnTxnFinish = true
 	ex.extraTxnState.txnFinishClosure.txnStartTime = txnStart
-	ex.extraTxnState.txnFinishClosure.implicit = ex.implicitTxn()
+	ex.extraTxnState.txnFinishClosure.implicit = isImplicitTxn
 	ex.extraTxnState.shouldExecuteOnTxnRestart = true
 
 	ex.statsCollector.StartTransaction()
@@ -3265,7 +3280,7 @@ func (ex *connExecutor) recordTransactionFinish(
 		transactionFingerprintID,
 		&recordedTxnStats,
 		ex.server.TelemetryLoggingMetrics,
-	)
+		ex.extraTxnState.isTrackedTelemetryTxn)
 
 	return ex.statsCollector.RecordTransaction(
 		ctx,

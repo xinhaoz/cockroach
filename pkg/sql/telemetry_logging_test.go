@@ -1850,7 +1850,7 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 	st := logtestutils.StubTime{}
 	sts := logtestutils.StubTracingStatus{}
 
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			EventLog: &EventLogTestingKnobs{
 				// The sampling checks below need to have a deterministic
@@ -1864,7 +1864,8 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 		},
 	})
 
-	defer s.Stopper().Stop(context.Background())
+	defer ts.Stopper().Stop(context.Background())
+	s := ts.ApplicationLayer()
 
 	// Start 2 txns. Start the second txn with enough elapsed time that would normally allow
 	// txn tracking for telemetry, however since we set the limit to 1 tracked txn, the
@@ -1984,15 +1985,8 @@ func TestTelemetryLoggingRespectsTxnLimit(t *testing.T) {
 		},
 	}
 
-	db := sqlutils.MakeSQLRunner(sqlDB)
-
-	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, s.AdvSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
-	defer cleanupGoDB()
-	sqlDB2, err := gosql.Open("postgres", pgURL.String())
-	require.NoError(t, err)
-	defer sqlDB2.Close()
-	db2 := sqlutils.MakeSQLRunner(sqlDB2)
+	db := sqlutils.MakeSQLRunner(s.SQLConn(t))
+	db2 := sqlutils.MakeSQLRunner(s.SQLConn(t))
 
 	st.SetTime(timeutil.FromUnixMicros(0))
 	db.Exec(t, `SET application_name = 'telemetry-logging-test-txn-limit'`)
@@ -2160,6 +2154,7 @@ func TestTelemetryLoggingTransactionMode(t *testing.T) {
 			stmtLogs := logSpy.getStatementLogs(true /* stripRedactionMarkers */)
 			txnLogs := logSpy.getTransactionLogs()
 			require.Equal(t, len(txns), len(txnLogs))
+			require.NotEmpty(t, stmtLogs)
 
 			var stmtLogsIdx, skippedStmtsCount int
 			// Verify expected statement logs are present.
@@ -2167,7 +2162,11 @@ func TestTelemetryLoggingTransactionMode(t *testing.T) {
 				txn := txnLogs[ti]
 				txnID := txn.TransactionID
 
-				require.Zero(t, txn.SkippedTransactions)
+				if ti == 0 {
+					require.Equal(t, int64(1), txn.SkippedTransactions)
+				} else {
+					require.Zero(t, txn.SkippedTransactions)
+				}
 
 				// All the statement logs for a transaction are contiguous in the log file.
 				// If this is not true something is wrong.
@@ -2253,7 +2252,7 @@ func TestTelemetryLoggingTransactionMode(t *testing.T) {
 			skippedTxnCount int64
 		}{
 			{
-				skippedTxnCount: 0,
+				skippedTxnCount: 1,
 				stmts: []expectedStmtLog{
 					{
 						logMsg:            `BEGIN`,
@@ -2348,13 +2347,14 @@ func TestTelemetryLoggingTransactionMode(t *testing.T) {
 			st.SetTime(stubTime)
 			sts.SetTracingStatus(query.tracingEnabled)
 			spiedConn.Exec(t, query.query)
-			t.Logf("last emitted time %d", telemetryLogging.mu.lastEmittedTime.UnixMicro())
 		}
 
 		log.FlushAllSync()
 
 		stmtLogs := logSpy.getStatementLogs(true /* stripRedactionMarkers */)
 		txnLogs := logSpy.getTransactionLogs()
+		require.NotEmpty(t, txnLogs)
+		require.NotEmpty(t, stmtLogs)
 
 		var stmtLogsIdx int
 		for ti, expectedTxn := range expectedTxns {
@@ -2369,7 +2369,6 @@ func TestTelemetryLoggingTransactionMode(t *testing.T) {
 			for {
 				stmt := stmtLogs[stmtLogsIdx]
 				expectedStmt := expectedTxn.stmts[stmtsCount]
-				t.Logf("%s %d", stmt.Statement, stmt.TxnCounter)
 				require.Contains(t, stmt.Statement, expectedStmt.logMsg)
 				require.Equal(t, expectedStmt.skippedQueryCount, int(stmt.SkippedQueries))
 				if stmt.Tag != "BEGIN" && stmt.Tag != "COMMIT" {

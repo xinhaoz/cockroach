@@ -1566,6 +1566,9 @@ type connExecutor struct {
 		// createdSequences keeps track of sequences created in the current transaction.
 		// The map key is the sequence descpb.ID.
 		createdSequences map[descpb.ID]struct{}
+
+		// isTrackedTelemetryTxn
+		isTrackedTelemetryTxn bool
 	}
 
 	// sessionDataStack contains the user-configurable connection variables.
@@ -2809,7 +2812,7 @@ func (ex *connExecutor) execCopyOut(
 			stmtFingerprintID,
 			&stats,
 			ex.statsCollector,
-		)
+			ex.extraTxnState.isTrackedTelemetryTxn)
 	}()
 
 	stmtTS := ex.server.cfg.Clock.PhysicalTime()
@@ -3058,7 +3061,8 @@ func (ex *connExecutor) execCopyIn(
 			ex.server.TelemetryLoggingMetrics,
 			stmtFingerprintID,
 			&stats,
-			ex.statsCollector)
+			ex.statsCollector,
+			ex.extraTxnState.isTrackedTelemetryTxn)
 	}()
 
 	var copyErr error
