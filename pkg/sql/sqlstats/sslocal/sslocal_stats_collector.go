@@ -54,6 +54,9 @@ type StatsCollector struct {
 
 	uniqueServerCounts *ssmemstorage.SQLStatsAtomicCounters
 
+	// Use to signal the stats writer is experiencing memory pressure.
+	memoryPressureSignal chan struct{}
+
 	st    *cluster.Settings
 	knobs *sqlstats.TestingKnobs
 }
@@ -65,16 +68,18 @@ func NewStatsCollector(
 	insights insights.Writer,
 	phaseTime *sessionphase.Times,
 	uniqueServerCounts *ssmemstorage.SQLStatsAtomicCounters,
+	memoryPressureSignal chan struct{},
 	knobs *sqlstats.TestingKnobs,
 ) *StatsCollector {
 	return &StatsCollector{
-		flushTarget:        appStats,
-		ApplicationStats:   appStats.NewApplicationStatsWithInheritedOptions(),
-		insightsWriter:     insights,
-		phaseTimes:         phaseTime.Clone(),
-		uniqueServerCounts: uniqueServerCounts,
-		st:                 st,
-		knobs:              knobs,
+		flushTarget:          appStats,
+		ApplicationStats:     appStats.NewApplicationStatsWithInheritedOptions(),
+		insightsWriter:       insights,
+		phaseTimes:           phaseTime.Clone(),
+		uniqueServerCounts:   uniqueServerCounts,
+		st:                   st,
+		memoryPressureSignal: memoryPressureSignal,
+		knobs:                knobs,
 	}
 }
 
