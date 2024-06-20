@@ -9,215 +9,215 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
-	"net"
+	"fmt"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
-	"os/signal"
-	"time"
+	"regexp"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib/ingest"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib/migrations"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib/obsutil"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib/router"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obspb"
-	logspb "github.com/cockroachdb/cockroach/pkg/obsservice/obspb/opentelemetry-proto/collector/logs/v1"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
-	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/ui"
+	_ "github.com/cockroachdb/cockroach/pkg/ui/distoss" // web UI init hooks
+	crdbhttputil "github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
-	"google.golang.org/grpc"
 )
 
-// drainSignals are the signals that will cause the server to drain and exit.
-//
-// The signals will initiate a graceful shutdown. If received a second time,
-// SIGINT will be reraised without a signal handler and the default action
-// terminate the process abruptly.
-//
-// Receiving SIGTERM a second time does not do a brutal shutdown, as SIGTERM is
-// named termSignal below.
-var drainSignals = []os.Signal{unix.SIGINT, unix.SIGTERM}
+var (
+	// Flags.
+	addr         string
+	insecure     bool
+	featureFlags string
 
-// termSignal is the signal that causes an idempotent graceful
-// shutdown (i.e. second occurrence does not incur hard shutdown).
-var termSignal os.Signal = unix.SIGTERM
+	uiConfigPath     = regexp.MustCompile("^/uiconfig$")
+	statusServerPath = "/_status/"
+	adminServerPath  = "/_admin/"
+)
 
-// defaultSinkDBName is the sink database name used for DB migrations, writes, etc.
-var defaultSinkDBName = "obsservice"
+// indexTemplate takes arguments about the current session and returns HTML
+// which includes the UI JavaScript bundles, plus a script tag which sets the
+// currently logged in user so that the UI JavaScript can decide whether to show
+// a login page.
+var indexHTML = []byte(`<!DOCTYPE html>
+<html>
+	<head>
+		<title>Cockroach Console</title>
+		<meta charset="UTF-8">
+		<link href="favicon.ico" rel="shortcut icon">
+	</head>
+	<body>
+		<div id="react-layout"></div>
+		<script src="bundle.js" type="text/javascript"></script>
+	</body>
+</html>
+`)
+
+type uiFeatureFlags struct {
+	is_observability_service        bool
+	can_view_kv_metric_dashboards   bool
+	disable_kv_level_advanced_debug bool
+}
+
+// UIConsole 'dataFromServer' fetched via /uiconfig.
+type config struct {
+	// Insecure is true if the server is running in insecure mode.
+	Insecure bool
+
+	LoggedInUser     *string
+	Tag              string
+	Version          string
+	NodeID           string
+	OIDCAutoLogin    bool
+	OIDCLoginEnabled bool
+	OIDCButtonText   string
+	FeatureFlags     uiFeatureFlags
+
+	OIDCGenerateJWTAuthTokenEnabled bool
+
+	LicenseType               string
+	SecondsUntilLicenseExpiry int64
+	IsManaged                 bool
+}
+
+// UIHandler is the repurposed Handler fn from the pkg/ui/ui.go pkg.
+func UIHandler() http.Handler {
+	// etags is used to provide a unique per-file checksum for each served file,
+	// which enables client-side caching using Cache-Control and ETag headers.
+	etags := make(map[string]string)
+
+	fileHandlerChain := crdbhttputil.EtagHandler(
+		etags,
+		http.FileServer(
+			http.FS(ui.Assets),
+		),
+	)
+
+	// Note: This can be used to retrieve latest js bundle.
+	// Alternatives: parse version.txt directly.
+	buildInfo := build.GetInfo()
+	major, minor := build.BranchReleaseSeries()
+	cfg := config{
+		Insecure:         insecure,
+		LoggedInUser:     nil,
+		Tag:              buildInfo.Tag,
+		Version:          fmt.Sprintf("v%d.%d", major, minor),
+		NodeID:           "1", // TODO discoverability API.
+		OIDCAutoLogin:    false,
+		OIDCLoginEnabled: false,
+		OIDCButtonText:   "blah blah",
+		FeatureFlags:     uiFeatureFlags{},
+
+		OIDCGenerateJWTAuthTokenEnabled: false,
+
+		LicenseType:               "OSS",
+		SecondsUntilLicenseExpiry: 0,
+		IsManaged:                 false,
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if uiConfigPath.MatchString(r.URL.Path) {
+			argBytes, err := json.Marshal(cfg)
+			if err != nil {
+				fmt.Printf("unable to deserialize ui config args: %v\n", err)
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			_, err = w.Write(argBytes)
+			if err != nil {
+				fmt.Printf("unable to write ui config args: %v\n", err)
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			return
+		}
+
+		if r.Header.Get("Crdb-Development") != "" {
+			http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
+			return
+		}
+
+		if r.URL.Path != "/" {
+			fileHandlerChain.ServeHTTP(w, r)
+			return
+		}
+
+		http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
+	})
+}
+
+// NewProxy creates a reverse proxy to the given target URL.
+func newProxy(target string) (*httputil.ReverseProxy, error) {
+	url, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	return httputil.NewSingleHostReverseProxy(url), nil
+}
 
 // RootCmd represents the base command when called without any subcommands
 var RootCmd = &cobra.Command{
-	Use:   "obsservice",
+	Use:   "dbconsole",
 	Short: "An observability service for CockroachDB",
 	Long: `The Observability Service ingests monitoring and observability data 
 from one or more CockroachDB clusters.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := context.Background()
+		fmt.Println("Hello World")
+		router := http.NewServeMux()
+		proxy, err := newProxy("http://localhost:8080")
 
-		if !noDB {
-			connCfg, err := pgxpool.ParseConfig(sinkPGURL)
-			if err != nil {
-				return errors.Wrapf(err, "invalid --sink-pgurl (%s)", sinkPGURL)
-			}
-			if connCfg.ConnConfig.Database != defaultSinkDBName {
-				if connCfg.ConnConfig.Database != "" {
-					log.Warningf(ctx,
-						"--sink-pgurl string contains a database name (%s) other than 'obsservice' - overriding",
-						connCfg.ConnConfig.Database)
-				}
-				// We don't want to accidentally write things to the wrong DB in the event that
-				// one is accidentally provided in the --sink-pgurl (as is common with defaultdb).
-				// Always override to defaultSinkDBName.
-				connCfg.ConnConfig.Database = defaultSinkDBName
-			}
-			if err := migrations.RunDBMigrations(ctx, connCfg.ConnConfig); err != nil {
-				return errors.Wrap(err, "failed to run DB migrations")
-			}
-		} else {
-			log.Info(ctx, "--no-db flag indicated, skipping DB migrations")
-		}
-
-		signalCh := make(chan os.Signal, 1)
-		signal.Notify(signalCh, drainSignals...)
-
-		stopper := stop.NewStopper()
-
-		// Run the event ingestion in the background.
-		eventRouter := router.NewEventRouter(map[obspb.EventType]obslib.EventConsumer{
-			obspb.EventlogEvent: &obsutil.StdOutConsumer{},
-		})
-		ingester := ingest.MakeEventIngester(ctx, eventRouter, nil)
-
-		// Instantiate the net listener & gRPC server.
-		listener, err := net.Listen("tcp", otlpAddr)
 		if err != nil {
-			return errors.Wrapf(err, "failed to listen for incoming HTTP connections on address %s", otlpAddr)
+			fmt.Fprintf(os.Stderr, "Failed to create reverse proxy: %v\n", err)
 		}
-		grpcServer := grpc.NewServer()
-		logspb.RegisterLogsServiceServer(grpcServer, ingester)
-		if err := stopper.RunAsyncTask(ctx, "server-quiesce", func(ctx context.Context) {
-			<-stopper.ShouldQuiesce()
-			grpcServer.GracefulStop()
-		}); err != nil {
+
+		router.Handle(statusServerPath, proxy)
+		router.Handle(adminServerPath, proxy)
+
+		// Handle all other routes.
+		assetHandler := UIHandler()
+		router.Handle("/", assetHandler)
+
+		fmt.Printf("Starting server on %s\n", addr)
+		if err := http.ListenAndServe(addr, router); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start server: %v\n", err)
 			return err
 		}
-		if err := stopper.RunAsyncTask(ctx, "event-ingester-server", func(ctx context.Context) {
-			if err := grpcServer.Serve(listener); err != nil {
-				log.Fatalf(ctx, "gRPC server returned an unexpected error: %+v", err)
-			}
-		}); err != nil {
-			return err
-		}
-		log.Infof(ctx, "Listening for OTLP connections on %s.\n", otlpAddr)
 
-		// Block until the process is signaled to terminate.
-		sig := <-signalCh
-		log.Infof(ctx, "received signal %s. Shutting down.", sig)
-		go func() {
-			stopper.Stop(ctx)
-		}()
-
-		// Print the shutdown progress every 5 seconds.
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					log.Infof(ctx, "%d running tasks", stopper.NumTasks())
-				case <-stopper.IsStopped():
-					return
-				}
-			}
-		}()
-
-		// Wait until the shutdown is complete or we receive another signal.
-		select {
-		case <-stopper.IsStopped():
-			log.Infof(ctx, "shutdown complete")
-		case sig = <-signalCh:
-			switch sig {
-			case termSignal:
-				log.Infof(ctx, "received SIGTERM while shutting down. Continuing shutdown.")
-			default:
-				// Crash.
-				handleSignalDuringShutdown(sig)
-			}
-		}
 		return nil
 	},
 }
 
-// Flags.
-var (
-	otlpAddr  string
-	httpAddr  string
-	noDB      bool
-	sinkPGURL string
-)
-
 func main() {
-
 	// Add all the flags registered with the standard "flag" package. Useful for
 	// --vmodule, for example.
 	RootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	RootCmd.PersistentFlags().StringVar(
-		&otlpAddr,
-		"otlp-addr",
-		"localhost:4317",
-		"The address on which to listen for exported events using OTLP gRPC. If the port is missing, 4317 is used.")
-	RootCmd.PersistentFlags().StringVar(
-		&httpAddr,
+		&addr,
 		"http-addr",
 		"localhost:8081",
 		"The address on which to listen for HTTP requests.")
 
-	// Flags about connecting to the sink cluster.
+	// TODO
 	RootCmd.PersistentFlags().StringVar(
-		&sinkPGURL,
-		"sink-pgurl",
-		"postgresql://root@localhost:26257?sslmode=disable",
-		"PGURL for the sink cluster. If the url does not include a database name, "+
-			"then \"obsservice\" will be used.")
+		&featureFlags,
+		"feature-flags",
+		"",
+		"TODO")
 
+	// TODO
 	RootCmd.PersistentFlags().BoolVar(
-		&noDB,
-		"no-db",
-		false,
-		"Disables usage of the external sink DB indicated by the --sink-pgurl flag at startup. "+
-			"Intended for testing purposes only.")
+		&insecure,
+		"insecure",
+		true,
+		"TODO")
 
 	if err := RootCmd.Execute(); err != nil {
-		exit.WithCode(exit.UnspecifiedError())
+		// Get error code
+		fmt.Print(context.Background(), "Error: %s", err.Error())
 	}
-}
-
-func handleSignalDuringShutdown(sig os.Signal) {
-	// On Unix, a signal that was not handled gracefully by the application
-	// should be reraised so it is visible in the exit code.
-
-	// Reset signal to its original disposition.
-	signal.Reset(sig)
-
-	// Reraise the signal. os.Signal is always sysutil.Signal.
-	if err := unix.Kill(unix.Getpid(), sig.(sysutil.Signal)); err != nil {
-		// Sending a valid signal to ourselves should never fail.
-		//
-		// Unfortunately it appears (#34354) that some users
-		// run CockroachDB in containers that only support
-		// a subset of all syscalls. If this ever happens, we
-		// still need to quit immediately.
-		log.Fatalf(context.Background(), "unable to forward signal %v: %v", sig, err)
-	}
-
-	// Block while we wait for the signal to be delivered.
-	select {}
 }
