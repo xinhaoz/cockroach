@@ -2063,6 +2063,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 			CanViewKvMetricDashboards:   s.rpcContext.TenantID.Equal(roachpb.SystemTenantID),
 			DisableKvLevelAdvancedDebug: false,
 		},
+		s.sqlServer.InternalExecutor(),
+		s.stopper,
 	); err != nil {
 		return err
 	}

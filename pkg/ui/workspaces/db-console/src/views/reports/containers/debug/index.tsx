@@ -686,6 +686,11 @@ export default function Debug() {
           />
         </DebugTableRow>
       </DebugTable>
+      <DebugTable heading="UI Upgrades">
+        <DebugTableRow title="Upgrade DB Console Version">
+          <DebugTableLink name="Available Versions" url="/upgrades" />
+        </DebugTableRow>
+      </DebugTable>
     </div>
   );
 }

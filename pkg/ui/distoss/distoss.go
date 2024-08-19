@@ -16,22 +16,9 @@
 
 package distoss
 
-import (
-	"bytes"
-	_ "embed"
-
-	"github.com/cockroachdb/cockroach/pkg/ui"
-	"github.com/cockroachdb/cockroach/pkg/util/assetbundle"
-)
-
-//go:embed assets.tar.zst
-var assets []byte
-
 func init() {
 	fs, err := assetbundle.AsFS(bytes.NewBuffer(assets))
 	if err != nil {
 		panic(err)
 	}
-	ui.Assets = fs
-	ui.HaveUI = true
 }

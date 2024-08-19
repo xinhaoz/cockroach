@@ -15,8 +15,4 @@ go_library(
     embedsrcs = [":genassets"],  # keep
     importpath = "github.com/cockroachdb/cockroach/pkg/ui/distoss",
     visibility = ["//visibility:public"],
-    deps = [
-        "//pkg/ui",
-        "//pkg/util/assetbundle",
-    ],
 )

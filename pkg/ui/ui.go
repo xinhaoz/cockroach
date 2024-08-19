@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -130,12 +131,13 @@ Binary built without web UI.
 
 // Config contains the configuration parameters for Handler.
 type Config struct {
-	Insecure bool
-	NodeID   *base.NodeIDContainer
-	GetUser  func(ctx context.Context) *string
-	OIDC     OIDCUI
-	Flags    serverpb.FeatureFlags
-	Settings *cluster.Settings
+	Insecure         bool
+	NodeID           *base.NodeIDContainer
+	GetUser          func(ctx context.Context) *string
+	OIDC             OIDCUI
+	Flags            serverpb.FeatureFlags
+	Settings         *cluster.Settings
+	InternalExecutor isql.Executor
 }
 
 var uiConfigPath = regexp.MustCompile("^/uiconfig$")

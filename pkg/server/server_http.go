@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ui"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -155,6 +156,8 @@ func (s *httpServer) setupRoutes(
 	handleInspectzUnauthenticated http.Handler,
 	apiServer http.Handler,
 	flags serverpb.FeatureFlags,
+	ie isql.Executor,
+	stopper *stop.Stopper,
 ) error {
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
@@ -167,7 +170,7 @@ func (s *httpServer) setupRoutes(
 	}
 
 	// Define the http.Handler for UI assets.
-	assetHandler := ui.Handler(ui.Config{
+	assetHandler := ui.HandlerV2(ui.Config{
 		Insecure: s.cfg.InsecureWebAccess(),
 		NodeID:   s.cfg.IDContainer,
 		OIDC:     oidc,
@@ -178,9 +181,10 @@ func (s *httpServer) setupRoutes(
 			}
 			return nil
 		},
-		Flags:    flags,
-		Settings: s.cfg.Settings,
-	})
+		Flags:            flags,
+		Settings:         s.cfg.Settings,
+		InternalExecutor: ie,
+	}, stopper)
 
 	// The authentication mux used here is created in "allow anonymous" mode so that the UI
 	// assets are served up whether or not there is a session. If there is a session, the mux

@@ -12,7 +12,12 @@ exports_files([
 
 go_library(
     name = "ui",
-    srcs = ["ui.go"],
+    srcs = [
+        "bucket_manager.go",
+        "dynamic_ui.go",
+        "ui.go",
+    ],
+    embedsrcs = ["upgradesPage.html"],
     importpath = "github.com/cockroachdb/cockroach/pkg/ui",
     visibility = ["//visibility:public"],
     deps = [
@@ -21,9 +26,15 @@ go_library(
         "//pkg/server/serverpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/isql",
+        "//pkg/util/assetbundle",
         "//pkg/util/httputil",
         "//pkg/util/log",
+        "//pkg/util/stop",
         "//pkg/util/timeutil",
+        "@com_google_cloud_go_storage//:storage",
+        "@org_golang_google_api//iterator",
+        "@org_golang_google_api//option",
     ],
 )
 

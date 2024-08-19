@@ -825,6 +825,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 				s.sqlServer.serviceMode == mtinfopb.ServiceModeShared,
 			DisableKvLevelAdvancedDebug: true,
 		},
+		s.sqlServer.InternalExecutor(),
+		s.stopper,
 	); err != nil {
 		return err
 	}
