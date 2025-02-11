@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-type bufferedStmtStats []sqlstats.RecordedStmtStats
+type bufferedStmtStats []*sqlstats.RecordedStmtStats
 
 // StatsCollector is used to collect statistics for transactions and
 // statements for the entire lifetime of a session. It must be closed
@@ -168,6 +168,7 @@ func (s *StatsCollector) StartTransaction() {
 // fingerprint ID is now available. StatsCollector will now go back to update
 // the transaction fingerprint ID field of all the statement statistics for that
 // txn.
+// This function also releases
 func (s *StatsCollector) EndTransaction(
 	ctx context.Context, transactionFingerprintID appstatspb.TransactionFingerprintID,
 ) (discardedStats int64) {
@@ -184,6 +185,7 @@ func (s *StatsCollector) EndTransaction(
 		if err := s.flushTarget.RecordStatement(ctx, stmt); err != nil {
 			discardedStats++
 		}
+		stmt.Release()
 	}
 
 	// Avoid taking locks if no stats are discarded.
@@ -230,7 +232,7 @@ func (s *StatsCollector) shouldObserveInsights() bool {
 
 // observeStatement sends the recorded statement stats to the insights system
 // for further processing.
-func (s *StatsCollector) observeStatement(value sqlstats.RecordedStmtStats) {
+func (s *StatsCollector) observeStatement(value *sqlstats.RecordedStmtStats) {
 	if !s.sendInsights {
 		return
 	}
@@ -337,7 +339,7 @@ func (s *StatsCollector) observeTransaction(value sqlstats.RecordedTxnStats) {
 
 // RecordStatement records the statistics of a statement.
 func (s *StatsCollector) RecordStatement(
-	ctx context.Context, value sqlstats.RecordedStmtStats,
+	ctx context.Context, value *sqlstats.RecordedStmtStats,
 ) error {
 	s.observeStatement(value)
 
@@ -347,6 +349,7 @@ func (s *StatsCollector) RecordStatement(
 
 	if s.writeDirectlyToFlushTarget {
 		err := s.flushTarget.RecordStatement(ctx, value)
+		value.Release()
 		return err
 	}
 

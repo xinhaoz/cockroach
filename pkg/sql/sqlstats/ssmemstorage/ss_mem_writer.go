@@ -38,7 +38,7 @@ var timestampSize = int64(unsafe.Sizeof(time.Time{}))
 // Note: This error is only related to the operation of recording the statement
 // statistics into in-memory structs. It is unrelated to the stmtErr in the
 // arguments.
-func (s *Container) RecordStatement(ctx context.Context, value sqlstats.RecordedStmtStats) error {
+func (s *Container) RecordStatement(ctx context.Context, value *sqlstats.RecordedStmtStats) error {
 	t := sqlstats.StatsCollectionLatencyThreshold.Get(&s.st.SV)
 	// TODO(117690): Unify StmtStatsEnable and TxnStatsEnable into a single cluster setting.
 	if !sqlstats.StmtStatsEnable.Get(&s.st.SV) || (t > 0 && t.Seconds() >= value.ServiceLatencySec) {

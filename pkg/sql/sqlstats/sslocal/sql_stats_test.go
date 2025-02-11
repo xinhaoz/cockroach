@@ -489,7 +489,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		for _, fingerprint := range testCase.fingerprints {
 			stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, testCase.implicit, "defaultdb")
 			err := statsCollector.RecordStatement(
-				ctx, sqlstats.RecordedStmtStats{
+				ctx, &sqlstats.RecordedStmtStats{
 					FingerprintID: stmtFingerprintID,
 					Query:         fingerprint,
 					ImplicitTxn:   testCase.implicit,
@@ -600,7 +600,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			for _, fingerprint := range txn.stmtFingerprints {
 				stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, false, "defaultdb")
 				err := statsCollector.RecordStatement(
-					ctx, sqlstats.RecordedStmtStats{FingerprintID: stmtFingerprintID, Query: fingerprint},
+					ctx, &sqlstats.RecordedStmtStats{FingerprintID: stmtFingerprintID, Query: fingerprint},
 				)
 				require.NoError(t, err)
 				txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
