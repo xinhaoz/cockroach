@@ -10,6 +10,7 @@ package sqlstats
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -138,4 +139,19 @@ type SSDrainer interface {
 	// Reset will reset all the stats in the drainer. Once reset, the stats will
 	// be lost.
 	Reset(ctx context.Context) error
+}
+
+var recordedStmtStatsPool = sync.Pool{
+	New: func() interface{} {
+		return new(RecordedStmtStats)
+	},
+}
+
+func NewRecordedStmtStats() *RecordedStmtStats {
+	return recordedStmtStatsPool.Get().(*RecordedStmtStats)
+}
+
+func (s *RecordedStmtStats) Release() {
+	*s = RecordedStmtStats{}
+	recordedStmtStatsPool.Put(s)
 }
