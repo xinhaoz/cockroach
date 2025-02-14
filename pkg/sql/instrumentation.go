@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -460,8 +461,10 @@ func (ih *instrumentationHelper) Setup(
 		}
 	}
 
+	stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+	statsCollector.SetStatementFingerprintID(stmtFingerprintID)
 	if collectTxnExecStats {
-		statsCollector.SetStatementSampled(stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+		statsCollector.SetStatementSampled(stmtFingerprintID)
 	} else {
 		collectTxnExecStats = func() bool {
 			if stmt.AST.StatementType() == tree.TypeTCL {
@@ -478,7 +481,7 @@ func (ih *instrumentationHelper) Setup(
 			// If this is the first time we see this statement in the current stats
 			// container, we'll collect its execution stats anyway (unless the user
 			// disabled txn or stmt stats collection entirely).
-			return statsCollector.ShouldSampleNewStatement(stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+			return statsCollector.ShouldSampleNewStatement(stmtFingerprintID)
 		}()
 	}
 

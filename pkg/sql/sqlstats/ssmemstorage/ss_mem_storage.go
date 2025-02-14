@@ -80,7 +80,7 @@ type Container struct {
 		// tracing. sampledPlanKey is used as the key to the map as it does not
 		// use transactionFingerprintID which is not available at the time of
 		// sampling decision.
-		sampledStatementCache map[sampledPlanKey]struct{}
+		sampledStatementCache map[appstatspb.StmtFingerprintID]struct{}
 	}
 
 	txnCounts transactionCounts
@@ -114,7 +114,7 @@ func New(
 
 	s.mu.stmts = make(map[stmtKey]*stmtStats)
 	s.mu.txns = make(map[appstatspb.TransactionFingerprintID]*txnStats)
-	s.mu.sampledStatementCache = make(map[sampledPlanKey]struct{})
+	s.mu.sampledStatementCache = make(map[appstatspb.StmtFingerprintID]struct{})
 
 	return s
 }
@@ -587,7 +587,7 @@ func (s *Container) clearLocked(ctx context.Context) {
 	// large for the likely future workload.
 	s.mu.stmts = make(map[stmtKey]*stmtStats, len(s.mu.stmts)/2)
 	s.mu.txns = make(map[appstatspb.TransactionFingerprintID]*txnStats, len(s.mu.txns)/2)
-	s.mu.sampledStatementCache = make(map[sampledPlanKey]struct{}, len(s.mu.sampledStatementCache)/2)
+	s.mu.sampledStatementCache = make(map[appstatspb.StmtFingerprintID]struct{}, len(s.mu.sampledStatementCache)/2)
 	if s.knobs != nil && s.knobs.OnAfterClear != nil {
 		s.knobs.OnAfterClear()
 	}

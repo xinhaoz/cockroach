@@ -149,34 +149,22 @@ func (s *Container) RecordStatement(
 
 // StatementSampled returns true if the statement with the given fingerprint
 // exists in the sampled statement cache.
-func (s *Container) StatementSampled(fingerprint string, implicitTxn bool, database string) bool {
-	key := sampledPlanKey{
-		stmtNoConstants: fingerprint,
-		implicitTxn:     implicitTxn,
-		database:        database,
-	}
+func (s *Container) StatementSampled(fingerprintID appstatspb.StmtFingerprintID) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.mu.sampledStatementCache[key]
+	_, ok := s.mu.sampledStatementCache[fingerprintID]
 	return ok
 }
 
 // TrySetStatementSampled attempts to add the statement to the sampled
 // statement cache. If the statement is already in the cache, it returns false.
-func (s *Container) TrySetStatementSampled(
-	fingerprint string, implicitTxn bool, database string,
-) bool {
-	key := sampledPlanKey{
-		stmtNoConstants: fingerprint,
-		implicitTxn:     implicitTxn,
-		database:        database,
-	}
+func (s *Container) TrySetStatementSampled(fingerprintID appstatspb.StmtFingerprintID) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.mu.sampledStatementCache[key]; ok {
+	if _, ok := s.mu.sampledStatementCache[fingerprintID]; ok {
 		return false
 	}
-	s.mu.sampledStatementCache[key] = struct{}{}
+	s.mu.sampledStatementCache[fingerprintID] = struct{}{}
 	return true
 }
 

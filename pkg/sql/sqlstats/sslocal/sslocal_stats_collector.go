@@ -137,7 +137,6 @@ func (s *StatsCollector) Reset(appStats *ssmemstorage.Container, phaseTime *sess
 
 	s.previousPhaseTimes = previousPhaseTime
 	s.phaseTimes = phaseTime.Clone()
-	s.stmtFingerprintID = 0
 }
 
 // Close frees any local memory used by the stats collector and
@@ -193,22 +192,22 @@ func (s *StatsCollector) EndTransaction(
 
 // ShouldSampleNewStatement returns true if the statement is a new statement
 // and we should sample its execution statistics.
-func (s *StatsCollector) ShouldSampleNewStatement(
-	fingerprint string, implicitTxn bool, database string,
-) bool {
+func (s *StatsCollector) ShouldSampleNewStatement(fingerprintID appstatspb.StmtFingerprintID) bool {
 	if s.uniqueServerCounts.GetStatementCount() >= s.uniqueServerCounts.UniqueStmtFingerprintLimit.Get(&s.st.SV) {
 		// The container is full. Since we can't insert more statements
 		// into the sql stats container, there's no point in sampling this
 		// statement.
 		return false
 	}
-	return s.flushTarget.TrySetStatementSampled(fingerprint, implicitTxn, database)
+	return s.flushTarget.TrySetStatementSampled(fingerprintID)
 }
 
-func (s *StatsCollector) SetStatementSampled(
-	fingerprint string, implicitTxn bool, database string,
-) {
-	s.flushTarget.TrySetStatementSampled(fingerprint, implicitTxn, database)
+func (s *StatsCollector) SetStatementSampled(fingerprintID appstatspb.StmtFingerprintID) {
+	s.flushTarget.TrySetStatementSampled(fingerprintID)
+}
+
+func (s *StatsCollector) SetStatementFingerprintID(fingerprintID appstatspb.StmtFingerprintID) {
+	s.stmtFingerprintID = fingerprintID
 }
 
 func getInsightStatus(statementError error) insights.Statement_Status {
@@ -340,13 +339,14 @@ func (s *StatsCollector) ObserveTransaction(
 func (s *StatsCollector) RecordStatement(
 	ctx context.Context, key appstatspb.StatementStatisticsKey, value sqlstats.RecordedStmtStats,
 ) (appstatspb.StmtFingerprintID, error) {
-	s.stmtFingerprintID = appstatspb.ConstructStatementFingerprintID(key.Query, key.ImplicitTxn, key.Database)
+	if s.stmtFingerprintID == 0 {
+		s.stmtFingerprintID = appstatspb.ConstructStatementFingerprintID(key.Query, key.ImplicitTxn, key.Database)
+	}
 	value.FingerprintID = s.stmtFingerprintID
 	if s.writeDirectlyToFlushTarget {
 		err := s.flushTarget.RecordStatement(ctx, key, value)
 		return s.stmtFingerprintID, err
 	}
-	s.stmtFingerprintID = appstatspb.ConstructStatementFingerprintID(key.Query, key.ImplicitTxn, key.Database)
 	// TODO(xinhaoz): This isn't the best place to set this, but we'll clean this up
 	// when we refactor the stats collection code to send the stats to an ingester.
 	s.stmtBuf = append(s.stmtBuf, &bufferedStmtStats{
