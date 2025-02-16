@@ -55,3 +55,8 @@ func (s *Set[V]) Range(f func(value V) bool) {
 		return f(value)
 	})
 }
+
+// Clear removes all values from the set.
+func (s *Set[V]) Clear() {
+	s.m.Clear()
+}
