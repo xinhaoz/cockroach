@@ -9,35 +9,20 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/redact"
 )
 
-// This registry is the central object in the insights subsystem. It observes
+// lockingRegistry is the central object in the insights subsystem. It observes
 // statement execution to determine which statements are outliers and
 // writes insights into the provided sink.
 type lockingRegistry struct {
-	statements   map[clusterunique.ID]*statementBuf
 	detector     detector
 	causes       *causes
 	store        *LockingStore
 	testingKnobs *TestingKnobs
-}
-
-func (r *lockingRegistry) Clear() {
-	r.statements = make(map[clusterunique.ID]*statementBuf)
-}
-
-func (r *lockingRegistry) ObserveStatement(statement *sqlstats.RecordedStmtStats) {
-	b, ok := r.statements[statement.SessionID]
-	if !ok {
-		b = statementsBufPool.Get().(*statementBuf)
-		r.statements[statement.SessionID] = b
-	}
-	b.append(statement)
 }
 
 type statementBuf []*sqlstats.RecordedStmtStats
@@ -85,39 +70,29 @@ func addProblem(arr []Problem, n Problem) []Problem {
 	return append(arr, n)
 }
 
-// ObserveTransaction determines if a transaction is slow or failed and records
+// observeTransaction determines if a transaction is slow or failed and records
 // an insight if so. It does so by examining the statements in the transaction
 // and marking them as slow or failed if they are.
 // NB: ObserveTransaction will clear the statements buffered in the registry for
 // the given sessionID. The buffer is returned to the pool and the statement
 // pointers are nilled.
-func (r *lockingRegistry) ObserveTransaction(
-	sessionID clusterunique.ID, transactionStats *sqlstats.RecordedTxnStats,
+func (r *lockingRegistry) observeTransaction(
+	transactionStats *sqlstats.RecordedTxnStats, statements []*sqlstats.RecordedStmtStats,
 ) {
 	if !r.enabled() {
 		return
 	}
 
-	if transactionStats.TransactionID.Equal(uuid.Nil) {
+	txnFingerprint := transactionStats.FingerprintID
+	if transactionStats.TransactionID.Equal(uuid.Nil) || txnFingerprint == 0 {
 		return
 	}
 
-	statements, ok := func() (*statementBuf, bool) {
-		statements, ok := r.statements[sessionID]
-		if !ok {
-			return nil, false
-		}
-		delete(r.statements, sessionID)
-		return statements, true
-	}()
-	if !ok {
-		return
-	}
-	defer statements.release()
+	sessionID := transactionStats.SessionID
 
 	// Mark statements which are detected as slow or have a failed status.
 	var slowOrFailedStatements intsets.Fast
-	for i, s := range *statements {
+	for i, s := range statements {
 		if !shouldIgnoreStatement(s) && (r.detector.isSlow(s) || s.Failed) {
 			slowOrFailedStatements.Add(i)
 		}
@@ -153,7 +128,7 @@ func (r *lockingRegistry) ObserveTransaction(
 	// this does not take into account the "Cancelled" transaction status.
 	var lastStmtErr redact.RedactableString
 	var lastStmtErrCode string
-	for i, recordedStmt := range *statements {
+	for i, recordedStmt := range statements {
 		s := makeStmtInsight(recordedStmt)
 		if slowOrFailedStatements.Contains(i) {
 			switch s.Status {
@@ -190,18 +165,6 @@ func (r *lockingRegistry) ObserveTransaction(
 	r.store.addInsight(insight)
 }
 
-// clearSession removes the session from the registry and releases the
-// associated statement buffer.
-func (r *lockingRegistry) clearSession(sessionID clusterunique.ID) {
-	if b, ok := r.statements[sessionID]; ok {
-		delete(r.statements, sessionID)
-		b.release()
-		if r.testingKnobs != nil && r.testingKnobs.OnSessionClear != nil {
-			r.testingKnobs.OnSessionClear(sessionID)
-		}
-	}
-}
-
 // TODO(todd):
 //
 //	Once we can handle sufficient throughput to live on the hot
@@ -216,7 +179,6 @@ func newRegistry(
 	st *cluster.Settings, detector detector, store *LockingStore, knobs *TestingKnobs,
 ) *lockingRegistry {
 	return &lockingRegistry{
-		statements:   make(map[clusterunique.ID]*statementBuf),
 		detector:     detector,
 		causes:       &causes{st: st},
 		store:        store,
