@@ -22,16 +22,17 @@ import (
 const defaultFlushInterval = time.Second * 1
 
 type SQLStatsSink interface {
-	// ObserveTransaction is called by the ingester to pass along a transaction and its statementsBySessionID.
+	// ObserveTransaction is called by the ingester to pass along a transaction event (possibly nil) and its
+	// statementsBySessionID.
 	// Note that the sink should transform the transaction and statementsBySessionID into the appropriate format
 	// as these objects will be returned to the pool.
 	ObserveTransaction(ctx context.Context, transaction *sqlstats.RecordedTxnStats, statements []*sqlstats.RecordedStmtStats)
 }
 
-// SQLConcurrentBufferIngester amortizes the locking cost of writing to
-// the sql stats container concurrently from multiple goroutines.
+// SQLStatsIngester collects and buffers statements and transactions per session
+// before passing them to the sinks when we receive complete information for a transaction.
 // Built around contentionutils.ConcurrentBufferGuard.
-type SQLConcurrentBufferIngester struct {
+type SQLStatsIngester struct {
 	guard struct {
 		*contentionutils.ConcurrentBufferGuard
 		eventBuffer *eventBuffer
@@ -44,10 +45,6 @@ type SQLConcurrentBufferIngester struct {
 		// a value of zero will be set to the 500ms default.
 		flushInterval time.Duration
 	}
-
-	// TODO(xinhaoz): Currently unused. In the next commits we'll start writing
-	// to the SQLStats sink.
-	sqlStatsSink *SQLStats
 
 	// We buffer ingested statementsBySessionID by session id.
 	statementsBySessionID map[clusterunique.ID]*statementBuf
@@ -73,6 +70,9 @@ func (b *statementBuf) append(statement *sqlstats.RecordedStmtStats) {
 }
 
 func (b *statementBuf) release() {
+	for i, n := 0, len(*b); i < n; i++ {
+		(*b)[i] = nil
+	}
 	*b = (*b)[:0]
 	statementsBufPool.Put(b)
 }
@@ -83,7 +83,7 @@ var statementsBufPool = sync.Pool{
 	},
 }
 
-// SQLConcurrentBufferIngester buffers the "events" it sees (via ObserveStatement
+// SQLStatsIngester buffers the "events" it sees (via IngestStatement
 // and IngestTransaction) and passes them along to the underlying registry
 // once its buffer is full. (Or once a timeout has passed, for low-traffic
 // clusters and tests.)
@@ -107,27 +107,25 @@ type event struct {
 	statement   *sqlstats.RecordedStmtStats
 }
 
-type BufferOpt func(i *SQLConcurrentBufferIngester)
+type BufferOpt func(i *SQLStatsIngester)
 
 // WithoutTimedFlush prevents the ConcurrentBufferIngester from performing
 // timed flushes to the underlying registry. Generally only useful for
 // testing purposes.
 func WithoutTimedFlush() BufferOpt {
-	return func(i *SQLConcurrentBufferIngester) {
+	return func(i *SQLStatsIngester) {
 		i.opts.noTimedFlush = true
 	}
 }
 
 // WithFlushInterval allows for the override of the default flush interval
 func WithFlushInterval(intervalMS int) BufferOpt {
-	return func(i *SQLConcurrentBufferIngester) {
+	return func(i *SQLStatsIngester) {
 		i.opts.flushInterval = time.Millisecond * time.Duration(intervalMS)
 	}
 }
 
-func (i *SQLConcurrentBufferIngester) Start(
-	ctx context.Context, stopper *stop.Stopper, opts ...BufferOpt,
-) {
+func (i *SQLStatsIngester) Start(ctx context.Context, stopper *stop.Stopper, opts ...BufferOpt) {
 	for _, opt := range opts {
 		opt(i)
 	}
@@ -173,14 +171,14 @@ func (i *SQLConcurrentBufferIngester) Start(
 
 // Clear flushes the underlying buffer, and signals the underlying registry
 // to clear any remaining cached data afterward. This is an async operation.
-func (i *SQLConcurrentBufferIngester) Clear() {
+func (i *SQLStatsIngester) Clear() {
 	i.guard.ForceSyncExec(func() {
 		// Our flush function defined on the guard is responsible for setting resetStatementsBuf back to 0.
 		i.resetStatementsBuf.Store(true)
 	})
 }
 
-func (i *SQLConcurrentBufferIngester) ingest(ctx context.Context, events *eventBuffer) {
+func (i *SQLStatsIngester) ingest(ctx context.Context, events *eventBuffer) {
 	for idx, e := range events {
 		// Because an eventBuffer is a fixed-size array, rather than a slice,
 		// we do not know how full it is until we hit a nil entry.
@@ -189,6 +187,11 @@ func (i *SQLConcurrentBufferIngester) ingest(ctx context.Context, events *eventB
 		}
 		if e.statement != nil {
 			i.processStatement(e.statement.SessionID, e.statement)
+			// When under an outer transaction, we don't have a txn to associate
+			// the stmts with so we can send immediately to the sinks.
+			if e.statement.UnderOuterTxn {
+				i.processTransaction(ctx, e.statement.SessionID, nil)
+			}
 		} else if e.transaction != nil {
 			i.processTransaction(ctx, e.transaction.SessionID, e.transaction)
 		} else {
@@ -198,7 +201,7 @@ func (i *SQLConcurrentBufferIngester) ingest(ctx context.Context, events *eventB
 	}
 }
 
-func (i *SQLConcurrentBufferIngester) IngestStatement(statement *sqlstats.RecordedStmtStats) {
+func (i *SQLStatsIngester) IngestStatement(statement *sqlstats.RecordedStmtStats) {
 	i.guard.AtomicWrite(func(writerIdx int64) {
 		i.guard.eventBuffer[writerIdx] = event{
 			sessionID: statement.SessionID,
@@ -207,7 +210,7 @@ func (i *SQLConcurrentBufferIngester) IngestStatement(statement *sqlstats.Record
 	})
 }
 
-func (i *SQLConcurrentBufferIngester) IngestTransaction(transaction *sqlstats.RecordedTxnStats) {
+func (i *SQLStatsIngester) IngestTransaction(transaction *sqlstats.RecordedTxnStats) {
 	i.guard.AtomicWrite(func(writerIdx int64) {
 		i.guard.eventBuffer[writerIdx] = event{
 			transaction: transaction,
@@ -217,7 +220,7 @@ func (i *SQLConcurrentBufferIngester) IngestTransaction(transaction *sqlstats.Re
 
 // ClearSession sends a signal to the underlying registry to clear any cached
 // data associated with the given sessionID. This is an async operation.
-func (i *SQLConcurrentBufferIngester) ClearSession(sessionID clusterunique.ID) {
+func (i *SQLStatsIngester) ClearSession(sessionID clusterunique.ID) {
 	i.guard.AtomicWrite(func(writerIdx int64) {
 		i.guard.eventBuffer[writerIdx] = event{
 			sessionID: sessionID,
@@ -225,8 +228,8 @@ func (i *SQLConcurrentBufferIngester) ClearSession(sessionID clusterunique.ID) {
 	})
 }
 
-func NewSQLConcurrentBufferIngester(sinks ...SQLStatsSink) *SQLConcurrentBufferIngester {
-	i := &SQLConcurrentBufferIngester{
+func NewSQLStatsIngester(sinks ...SQLStatsSink) *SQLStatsIngester {
+	i := &SQLStatsIngester{
 		// A channel size of 1 is sufficient to avoid unnecessarily
 		// synchronizing producer (our clients) and consumer (the underlying
 		// registry): moving from 0 to 1 here resulted in a 25% improvement
@@ -266,14 +269,14 @@ func NewSQLConcurrentBufferIngester(sinks ...SQLStatsSink) *SQLConcurrentBufferI
 
 // clearSession removes the session from the registry and releases the
 // associated statement buffer.
-func (i *SQLConcurrentBufferIngester) clearSession(sessionID clusterunique.ID) {
+func (i *SQLStatsIngester) clearSession(sessionID clusterunique.ID) {
 	if b, ok := i.statementsBySessionID[sessionID]; ok {
 		delete(i.statementsBySessionID, sessionID)
 		b.release()
 	}
 }
 
-func (i *SQLConcurrentBufferIngester) processStatement(
+func (i *SQLStatsIngester) processStatement(
 	sessionID clusterunique.ID, statement *sqlstats.RecordedStmtStats,
 ) {
 	b, ok := i.statementsBySessionID[sessionID]
@@ -284,7 +287,9 @@ func (i *SQLConcurrentBufferIngester) processStatement(
 	b.append(statement)
 }
 
-func (i *SQLConcurrentBufferIngester) processTransaction(
+// processTransaction takes the provided transaction and statementsBySessionID associated with the
+// session and passes them to the registered sinks. It is possible that transaction is nil here.
+func (i *SQLStatsIngester) processTransaction(
 	ctx context.Context, sessionID clusterunique.ID, transaction *sqlstats.RecordedTxnStats,
 ) {
 	statements, ok := func() (*statementBuf, bool) {
@@ -305,8 +310,10 @@ func (i *SQLConcurrentBufferIngester) processTransaction(
 	}
 
 	// Set the transaction fingerprint ID for each statement.
+	// These values are only known at the time of the transaction.
 	for _, s := range *statements {
 		s.TransactionFingerprintID = transaction.FingerprintID
+		s.ImplicitTxn = transaction.ImplicitTxn
 	}
 
 	for _, sink := range i.sinks {

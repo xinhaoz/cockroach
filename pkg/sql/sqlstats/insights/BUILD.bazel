@@ -41,7 +41,6 @@ go_test(
     srcs = [
         "causes_test.go",
         "detector_test.go",
-        "ingester_test.go",
         "insights_test.go",
         "registry_test.go",
         "store_test.go",
@@ -56,8 +55,6 @@ go_test(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sqlstats",
-        "//pkg/util/leaktest",
-        "//pkg/util/log",
         "//pkg/util/stop",
         "//pkg/util/uint128",
         "//pkg/util/uuid",

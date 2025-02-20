@@ -73,7 +73,7 @@ type testEvent struct {
 	transactionID, statementID uint64
 }
 
-func ingestEventsSync(ingester *SQLConcurrentBufferIngester, events []testEvent) {
+func ingestEventsSync(ingester *SQLStatsIngester, events []testEvent) {
 	for _, e := range events {
 		if e.statementID != 0 {
 			ingester.IngestStatement(&sqlstats.RecordedStmtStats{
@@ -154,7 +154,7 @@ func TestSQLIngester(t *testing.T) {
 			defer stopper.Stop(ctx)
 
 			testSink := &sqlStatsTestSink{}
-			ingester := NewSQLConcurrentBufferIngester(testSink)
+			ingester := NewSQLStatsIngester(testSink)
 
 			ingester.Start(ctx, stopper, WithFlushInterval(10))
 			ingestEventsSync(ingester, tc.observations)
@@ -187,7 +187,7 @@ func TestSQLIngester_Clear(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ingesterCtx)
 	testSink := &sqlStatsTestSink{}
-	ingester := NewSQLConcurrentBufferIngester(testSink)
+	ingester := NewSQLStatsIngester(testSink)
 	ingester.Start(ingesterCtx, stopper, WithoutTimedFlush())
 
 	// Fill the ingester's buffer with some data.
@@ -230,7 +230,7 @@ func TestSQLIngester_DoesNotBlockWhenReceivingManyObservationsAfterShutdown(t *t
 	defer stopper.Stop(ctx)
 
 	sink := &sqlStatsTestSink{}
-	ingester := NewSQLConcurrentBufferIngester(sink)
+	ingester := NewSQLStatsIngester(sink)
 	ingester.Start(ctx, stopper)
 
 	// Simulate a shutdown and wait for the consumer of the ingester's channel to stop.
@@ -272,7 +272,7 @@ func TestSQLIngesterBlockedForceSync(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	sink := &sqlStatsTestSink{}
-	ingester := NewSQLConcurrentBufferIngester(sink)
+	ingester := NewSQLStatsIngester(sink)
 
 	// We queue up a bunch of sync operations because it's unclear how
 	// many will proceed between the `Start()` and `Stop()` calls below.
@@ -309,7 +309,7 @@ func TestSQLIngester_ClearSession(t *testing.T) {
 			SessionID: sessionB,
 		}
 		// Create an ingester with no sinks.
-		ingester := NewSQLConcurrentBufferIngester()
+		ingester := NewSQLStatsIngester()
 		ingester.IngestStatement(statementA)
 		ingester.IngestStatement(statementB)
 		require.Len(t, ingester.statementsBySessionID, 2)
