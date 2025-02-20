@@ -824,6 +824,26 @@ func TestSQLStatsStmtSampling(t *testing.T) {
 		checkSampled("SELECT _, _", false /* implicit */, true /* sampled */)
 	})
 
+	t.Run("clear sampled cache", func(t *testing.T) {
+		require.NoError(t, sqlStats.Reset(ctx))
+		sqlRun.Exec(t, `SET CLUSTER SETTING sql.txn_stats.sample_rate = 0.01;`)
+		// To start, we should not have any statements sampled.
+		checkSampled("SELECT _", true /* implicit */, false /* sampled */)
+		checkSampled("SELECT _, _", true /* implicit */, false /* sampled */)
+
+		// Execute each of the above statements to trigger a 'first time' trace.
+		sqlRun.Exec(t, "SELECT 1")
+		sqlRun.Exec(t, "SELECT 1, 2")
+		checkSampled("SELECT _", true /* implicit */, true /* sampled */)
+		checkSampled("SELECT _, _", true /* implicit */, true /* sampled */)
+
+		// Clearing the sql stats containers should clear the sampled cache.
+		require.NoError(t, sqlStats.Reset(ctx))
+		// Now we should not have any statements sampled.
+		checkSampled("SELECT _", true /* implicit */, false /* sampled */)
+		checkSampled("SELECT _, _", true /* implicit */, false /* sampled */)
+	})
+
 }
 
 func TestPersistedSQLStats_Flush(t *testing.T) {

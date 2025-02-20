@@ -151,15 +151,11 @@ func (s *Container) RecordStatement(ctx context.Context, value *sqlstats.Recorde
 // StatementSampled returns true if the statement with the given fingerprint
 // exists in the sampled statement cache.
 func (s *Container) StatementSampled(fingerprint string, implicitTxn bool, database string) bool {
-	key := sampledPlanKey{
+	return s.sampledStatementCache.Contains(sampledPlanKey{
 		stmtNoConstants: fingerprint,
 		implicitTxn:     implicitTxn,
 		database:        database,
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.mu.sampledStatementCache[key]
-	return ok
+	})
 }
 
 // TrySetStatementSampled attempts to add the statement to the sampled
@@ -167,18 +163,11 @@ func (s *Container) StatementSampled(fingerprint string, implicitTxn bool, datab
 func (s *Container) TrySetStatementSampled(
 	fingerprint string, implicitTxn bool, database string,
 ) bool {
-	key := sampledPlanKey{
+	return s.sampledStatementCache.Add(sampledPlanKey{
 		stmtNoConstants: fingerprint,
 		implicitTxn:     implicitTxn,
 		database:        database,
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.mu.sampledStatementCache[key]; ok {
-		return false
-	}
-	s.mu.sampledStatementCache[key] = struct{}{}
-	return true
+	})
 }
 
 // RecordTransaction saves per-transaction statistics.
