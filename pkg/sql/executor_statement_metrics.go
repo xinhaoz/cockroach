@@ -167,8 +167,7 @@ func (ex *connExecutor) recordStatementSummary(
 	implicitTxn := flags.IsSet(planFlagImplicitTxn)
 	stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 		stmt.StmtNoConstants, implicitTxn, planner.SessionData().Database)
-	recordedStmtStats := sqlstats.NewRecordedStmtStats()
-	*recordedStmtStats = sqlstats.RecordedStmtStats{
+	recordedStmtStats := &sqlstats.RecordedStmtStats{
 		FingerprintID:        stmtFingerprintID,
 		QuerySummary:         stmt.StmtSummary,
 		DistSQL:              flags.ShouldBeDistributed(),

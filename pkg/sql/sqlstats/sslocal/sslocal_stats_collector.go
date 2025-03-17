@@ -185,7 +185,6 @@ func (s *StatsCollector) EndTransaction(
 		if err := s.flushTarget.RecordStatement(ctx, stmt); err != nil {
 			discardedStats++
 		}
-		stmt.Release()
 	}
 
 	// Avoid taking locks if no stats are discarded.
@@ -349,7 +348,6 @@ func (s *StatsCollector) RecordStatement(
 
 	if s.writeDirectlyToFlushTarget {
 		err := s.flushTarget.RecordStatement(ctx, value)
-		value.Release()
 		return err
 	}
 
