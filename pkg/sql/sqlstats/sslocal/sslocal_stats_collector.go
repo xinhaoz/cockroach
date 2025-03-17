@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 )
 
-type bufferedStmtStats []sqlstats.RecordedStmtStats
+type bufferedStmtStats []*sqlstats.RecordedStmtStats
 
 // StatsCollector is used to collect statistics for transactions and
 // statements for the entire lifetime of a session. It must be closed
@@ -216,22 +216,12 @@ func (s *StatsCollector) shouldObserveInsights() bool {
 	return sqlstats.StmtStatsEnable.Get(&s.st.SV) && sqlstats.TxnStatsEnable.Get(&s.st.SV)
 }
 
-// observeTransaction sends the recorded transaction stats to the insights system
-// for further processing.
-func (s *StatsCollector) observeTransaction(value sqlstats.RecordedTxnStats) {
-	if s.sendInsights && s.insightsWriter != nil {
-		insight := insights.MakeTxnInsight(value)
-		s.insightsWriter.ObserveTransaction(value.SessionID, insight)
-	}
-}
-
 // RecordStatement records the statistics of a statement.
 func (s *StatsCollector) RecordStatement(
-	ctx context.Context, value sqlstats.RecordedStmtStats,
+	ctx context.Context, value *sqlstats.RecordedStmtStats,
 ) error {
 	if s.sendInsights && s.insightsWriter != nil {
-		insight := insights.MakeStmtInsight(value)
-		s.insightsWriter.ObserveStatement(value.SessionID, insight)
+		s.insightsWriter.ObserveStatement(value.SessionID, value)
 	}
 
 	// TODO(xinhaoz): This isn't the best place to set this, but we'll clean this up
@@ -250,9 +240,11 @@ func (s *StatsCollector) RecordStatement(
 // RecordTransaction records the statistics of a transaction.
 // Transaction stats are always recorded directly on the flushTarget.
 func (s *StatsCollector) RecordTransaction(
-	ctx context.Context, value sqlstats.RecordedTxnStats,
+	ctx context.Context, value *sqlstats.RecordedTxnStats,
 ) error {
-	s.observeTransaction(value)
+	if s.sendInsights && s.insightsWriter != nil {
+		s.insightsWriter.ObserveTransaction(value.SessionID, value)
+	}
 
 	// TODO(117690): Unify StmtStatsEnable and TxnStatsEnable into a single cluster setting.
 	if !sqlstats.TxnStatsEnable.Get(&s.st.SV) {
@@ -279,8 +271,7 @@ func (s *StatsCollector) IterateStatementStats(
 // property is part of the statement fingerprint ID, we need to update the
 // fingerprint ID of all the statements in the current transaction.
 func (s *StatsCollector) UpgradeToExplicitTransaction() {
-	for i := range s.stmtBuf {
-		stmt := &s.stmtBuf[i]
+	for _, stmt := range s.stmtBuf {
 		// Recalculate stmt fingerprint id.
 		stmt.ImplicitTxn = false
 		stmt.FingerprintID = appstatspb.ConstructStatementFingerprintID(stmt.Query, false /* implicit */, stmt.Database)

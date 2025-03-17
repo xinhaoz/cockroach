@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/redact"
 )
@@ -29,10 +30,9 @@ func (r *lockingRegistry) Clear() {
 	r.statements = make(map[clusterunique.ID]*statementBuf)
 }
 
-func (r *lockingRegistry) ObserveStatement(sessionID clusterunique.ID, statement *Statement) {
-	if !r.enabled() {
-		return
-	}
+func (r *lockingRegistry) ObserveStatement(
+	sessionID clusterunique.ID, statement *sqlstats.RecordedStmtStats,
+) {
 	b, ok := r.statements[sessionID]
 	if !ok {
 		b = statementsBufPool.Get().(*statementBuf)
@@ -41,13 +41,14 @@ func (r *lockingRegistry) ObserveStatement(sessionID clusterunique.ID, statement
 	b.append(statement)
 }
 
-type statementBuf []*Statement
+type statementBuf []*sqlstats.RecordedStmtStats
 
-func (b *statementBuf) append(statement *Statement) {
+func (b *statementBuf) append(statement *sqlstats.RecordedStmtStats) {
 	*b = append(*b, statement)
 }
 
 func (b *statementBuf) release() {
+	// Clear the buffer.
 	for i, n := 0, len(*b); i < n; i++ {
 		(*b)[i] = nil
 	}
@@ -85,11 +86,19 @@ func addProblem(arr []Problem, n Problem) []Problem {
 	return append(arr, n)
 }
 
-func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transaction *Transaction) {
+// ObserveTransaction determines if a transaction is slow or failed and records
+// an insight if so. It does so by examining the statements in the transaction
+// and marking them as slow or failed if they are.
+// NB: ObserveTransaction will clear the statements buffered in the registry for
+// the given sessionID. The buffer is returned to the pool along with the
+// statements it contains.
+func (r *lockingRegistry) ObserveTransaction(
+	sessionID clusterunique.ID, transactionStats *sqlstats.RecordedTxnStats,
+) {
 	if !r.enabled() {
 		return
 	}
-	if transaction.ID.String() == "00000000-0000-0000-0000-000000000000" {
+	if transactionStats.TransactionID.String() == "00000000-0000-0000-0000-000000000000" {
 		return
 	}
 	statements, ok := func() (*statementBuf, bool) {
@@ -108,20 +117,17 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 	// Mark statements which are detected as slow or have a failed status.
 	var slowOrFailedStatements intsets.Fast
 	for i, s := range *statements {
-		if !shouldIgnoreStatement(s) && (r.detector.isSlow(s) || isFailed(s)) {
+		if !shouldIgnoreStatement(s) && (r.detector.isSlow(s) || s.Failed) {
 			slowOrFailedStatements.Add(i)
 		}
 	}
 
-	// So far this is the only case when a transaction is considered slow.
+	// So far this is the only case when a transactionStats is considered slow.
 	// In the future, we may want to make a detector for transactions if there
 	// are more cases.
-	highContention := false
-	if transaction.Contention != nil {
-		highContention = transaction.Contention.Seconds() >= LatencyThreshold.Get(&r.causes.st.SV).Seconds()
-	}
+	highContention := transactionStats.ExecStats.ContentionTime.Seconds() >= LatencyThreshold.Get(&r.causes.st.SV).Seconds()
 
-	txnFailed := transaction.Status == Transaction_Failed
+	txnFailed := !transactionStats.Committed
 	if slowOrFailedStatements.Empty() && !highContention && !txnFailed {
 		// We only record an insight if we have slow statements, high txn contention, or failed executions.
 		return
@@ -129,6 +135,7 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 
 	// Note that we'll record insights for every statement, not just for
 	// the slow ones.
+	transaction := makeTxnInsight(transactionStats)
 	insight := makeInsight(sessionID, transaction)
 
 	if highContention {
@@ -140,12 +147,13 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		insight.Transaction.Problems = addProblem(insight.Transaction.Problems, Problem_FailedExecution)
 	}
 
-	// The transaction status will reflect the status of its statements; it will
+	// The transactionStats status will reflect the status of its statements; it will
 	// default to completed unless a failed statement status is found. Note that
-	// this does not take into account the "Cancelled" transaction status.
+	// this does not take into account the "Cancelled" transactionStats status.
 	var lastStmtErr redact.RedactableString
 	var lastStmtErrCode string
-	for i, s := range *statements {
+	for i, recordedStmt := range *statements {
+		s := makeStmtInsight(recordedStmt)
 		if slowOrFailedStatements.Contains(i) {
 			switch s.Status {
 			case Statement_Completed:
@@ -171,9 +179,9 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 	}
 
 	if transaction.LastErrorCode == "" && lastStmtErrCode != "" {
-		// Stmt failure equates to transaction failure. Sometimes we
-		// can't propagate the error up to the transaction level so
-		// we manually set the transaction's failure info here.
+		// Stmt failure equates to transactionStats failure. Sometimes we
+		// can't propagate the error up to the transactionStats level so
+		// we manually set the transactionStats's failure info here.
 		transaction.LastErrorMsg = lastStmtErr
 		transaction.LastErrorCode = lastStmtErrCode
 	}
