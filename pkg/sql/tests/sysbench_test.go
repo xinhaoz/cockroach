@@ -201,6 +201,8 @@ func newSysbenchSQL(nodes int, localRPCFastPath bool) sysbenchDriverConstructor 
 			cleanupURL()
 			tc.Stopper().Stop(ctx)
 		}
+		conn := try(pgx.Connect(ctx, pgURL.String()))
+		try(conn.Exec(ctx, `SET CLUSTER SETTING sql.metrics.statement_details.enabled = false`))
 		return &sysbenchSQL{
 			ctx:     ctx,
 			stopper: tc.Stopper(),
